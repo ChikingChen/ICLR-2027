@@ -1,5 +1,117 @@
 # CODEX 变更说明
 
+## 2026-05-19 记录新服务器状态并删除旧文档入口
+
+### 变更文件
+
+- `AGENTS.md`
+  - 按当前新服务器状态重写协作说明。
+  - 将工作区路径更新为 `/data/czy/ICLR-2027`。
+  - 记录旧的 `dl-a800` 和 `ruler-glm44` conda 环境当前不可见。
+  - 记录当前可见环境为 `base` 和 `model_download`，且当前都缺少 `torch` 等 RULER 推理依赖。
+  - 记录当前 `nvidia-smi` 无法和 NVIDIA driver 通信，GPU 状态需要重新确认。
+  - 将模型目录更新为 `Llama-3.1-8B`、`Qwen2.5-7B-Instruct-1M`、`GLM-4-9B-Chat-1M` 和 `Yi-9B-200K`。
+  - 记录 `RULER/benchmark_root/` 当前不存在，转换后的 jsonl、预测输出、评分输出和 timing 文件都需要重新生成。
+  - 将命令示例改为新路径和占位环境 `<ruler-env>`，避免继续使用旧服务器路径和旧环境名。
+
+- `README.md`
+  - 按用户要求删除根目录 README，后续由用户重新整理。
+
+- `RULER/docker/Dockerfile`
+  - 按用户要求删除旧 Docker 模板。
+
+- `RULER/docker/requirements.txt`
+  - 按用户要求删除旧 Docker 依赖清单。
+
+- `CODEX_CHANGES.md`
+  - 记录本次环境梳理、文档更新和删除操作。
+
+### 变更目的
+
+本次变更用于把仓库说明从旧服务器迁移到当前新服务器状态，避免后续继续复制不可用的 `dl-a800`、`ruler-glm44`、`/home/test05/czyprojects` 和旧模型目录命令。同时删除不再需要的根目录 README 和 RULER 旧 Docker 模板。
+
+### 主要函数和类
+
+本次只修改文档和删除文档/模板文件，没有新增或修改函数、类。
+
+### 运行方式
+
+当前新服务器尚未配置完整 RULER 推理环境。正式运行前需要先创建或指定新的 `<ruler-env>`，安装 `torch`、`transformers`、`pyarrow`、`pandas`、`nltk` 等依赖，并确认 GPU driver 和 CUDA 可用。
+
+配置完成后，基础检查命令为：
+
+```bash
+cd /data/czy/ICLR-2027
+conda run -n <ruler-env> python -c "import torch, transformers, pyarrow, pandas, nltk; print('ok')"
+conda run -n <ruler-env> python -c "import torch; print(torch.cuda.is_available())"
+nvidia-smi
+```
+
+重新生成 RULER jsonl 输入：
+
+```bash
+cd /data/czy/ICLR-2027
+conda run -n <ruler-env> python RULER/scripts/data/prepare_parquet.py
+```
+
+runner dry-run 示例：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run -n <ruler-env> python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --dry-run
+```
+
+### 测试和验证
+
+文档和文件删除变更，验证命令：
+
+```bash
+git diff --check
+git -C RULER diff --check
+```
+
+本次还做了只读环境检查：
+
+```bash
+git status --short
+git -C RULER status --short
+find models -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort
+conda env list
+python --version
+conda run -n model_download python --version
+python -c "import torch, transformers, pyarrow, pandas, nltk; print('ok')"
+conda run -n model_download python -c "import torch, transformers, pyarrow, pandas, nltk; print('ok')"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
+find benchmark/RULER-llama3-1M -mindepth 1 -maxdepth 1 -type d ! -name '.cache' | wc -l
+find benchmark/RULER-llama3-1M -name 'validation-*.parquet' | wc -l
+find RULER -path '*benchmark_root*' -print
+find . -name '*.jsonl' | wc -l
+```
+
+检查结论：
+
+- 当前可见模型目录为 `GLM-4-9B-Chat-1M`、`Llama-3.1-8B`、`Qwen2.5-7B-Instruct-1M`、`Yi-9B-200K`。
+- 当前 conda 环境只有 `base` 和 `model_download`。
+- `base` 与 `model_download` 均缺少 `torch`。
+- 当前 `nvidia-smi` 无法和 NVIDIA driver 通信。
+- 当前没有 `RULER/benchmark_root/`，仓库内 `.jsonl` 数量为 0。
+- 原始 parquet benchmark 仍存在，117 个任务长度目录，118 个 parquet 分片。
+
+### 假设和限制
+
+- “删除 README.md”按根目录 `README.md` 理解；`RULER/README.md` 作为上游 RULER 说明保留。
+- 当前没有尝试安装依赖、下载模型或运行推理，避免在未确认环境策略前改变服务器环境。
+- `RULER/docker/` 删除后，后续若需要容器化，应重新按当前模型和依赖版本设计 Dockerfile，而不是恢复旧模板。
+- 由于当前 RULER 运行环境未配置，本次没有运行 Python 单元测试或 py_compile。
+
 ## 2026-05-13 新增根目录 README 使用说明
 
 ### 变更文件
