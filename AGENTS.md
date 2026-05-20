@@ -374,7 +374,7 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u pred/cal
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-conda run -n <ruler-env> python eval/evaluate.py \
+conda run --no-capture-output -n model python eval/evaluate.py \
   --data_dir ../benchmark_root/local_eval/Llama-3.1-8B/synthetic/4096/pred \
   --benchmark synthetic
 ```
@@ -385,14 +385,14 @@ conda run -n <ruler-env> python eval/evaluate.py \
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-conda run -n <ruler-env> python eval/collect_results.py \
+conda run --no-capture-output -n model python eval/collect_results.py \
   --output-root ../benchmark_root/local_eval \
   --data-root ../benchmark_root/parquet_data/synthetic \
   --benchmark synthetic \
-  --seq-lengths all \
+  --seq-lengths 4096 \
   --tasks all \
   --timing-file ../benchmark_root/local_eval/ruler_timing.jsonl \
-  --output-file ../benchmark_root/local_eval/ruler_results.xlsx
+  --output-file ../benchmark_root/local_eval/ruler_results_4k_all_models.xlsx
 ```
 
 `ruler_results.xlsx` 包含：
@@ -431,6 +431,14 @@ wc -l RULER/benchmark_root/parquet_data/synthetic/4096/data/*/validation.jsonl
 wc -l RULER/benchmark_root/local_eval/Llama-3.1-8B/synthetic/4096/pred/*.jsonl
 ```
 
+查看 4k 到 64k 每个任务有多少条输入样本：
+
+```bash
+cd /data/czy/ICLR-2027
+python -B tools/count_ruler_samples.py
+python -B tools/count_ruler_samples.py --format csv > ruler_sample_counts_4k_64k.csv
+```
+
 ### 8. Llama 单样本完整 attention 导出
 
 `tools/dump_llama_attention.py` 是独立诊断脚本，不接入 `RULER/scripts/pred/call_api.py`，也不修改 benchmark 预测输出。它适合只观察一个 Llama 模型在一个 RULER 样本上的生成过程：先生成回答 token，再用 KV cache replay 逐个导出每个生成 token 的完整 attention。
@@ -439,7 +447,7 @@ wc -l RULER/benchmark_root/local_eval/Llama-3.1-8B/synthetic/4096/pred/*.jsonl
 
 ```bash
 cd /data/czy/ICLR-2027
-CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n <ruler-env> python -u tools/dump_llama_attention.py \
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u tools/dump_llama_attention.py \
   --model-path models/Llama-3.1-8B \
   --data-file RULER/benchmark_root/parquet_data/synthetic/4096/data/niah_single_1/validation.jsonl \
   --sample-offset 0 \
@@ -453,7 +461,7 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n <ruler-env> python -u to
 
 ```bash
 cd /data/czy/ICLR-2027
-conda run -n <ruler-env> python tools/inspect_attention_dump.py \
+conda run --no-capture-output -n model python tools/inspect_attention_dump.py \
   --dump-dir attention_dumps/llama_niah_single_1_sample_0 \
   --generated-token 0 \
   --layer 0 \
@@ -490,26 +498,27 @@ conda run -n <ruler-env> python tools/inspect_attention_dump.py \
 
 ## 构建、测试与开发命令
 
-本项目没有构建步骤。当前新服务器没有配置完整 RULER 运行环境，因此下面命令需要在 `<ruler-env>` 配好后运行。
+本项目没有构建步骤。当前默认使用 `model` 环境运行测试和脚本检查。
 
 修改 RULER parquet 转换、并行 runner、`RULER/scripts/pred/call_api.py` 或模型 wrapper 后，至少运行：
 
 ```bash
 cd /data/czy/ICLR-2027
-conda run -n <ruler-env> python -B -m unittest discover -s tests
-conda run -n <ruler-env> python -B -m py_compile \
+conda run --no-capture-output -n model python -B -m unittest discover -s tests
+conda run --no-capture-output -n model python -B -m py_compile \
   RULER/scripts/data/prepare_parquet.py \
   RULER/scripts/run_parquet_parallel.py \
   RULER/scripts/pred/call_api.py \
   RULER/scripts/pred/model_wrappers.py \
-  RULER/scripts/eval/collect_results.py
+  RULER/scripts/eval/collect_results.py \
+  tools/count_ruler_samples.py
 ```
 
 再运行一个 runner dry-run：
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-conda run -n <ruler-env> python -B run_parquet_parallel.py \
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model Llama-3.1-8B=../../models/Llama-3.1-8B \
   --seq-lengths 4096 \
   --tasks niah_single_1 \

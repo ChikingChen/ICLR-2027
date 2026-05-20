@@ -1,5 +1,74 @@
 # CODEX 变更说明
 
+## 2026-05-20 更新当前 model 环境和 RULER 命令说明
+
+### 变更文件
+
+- `AGENTS.md`
+  - 将当前环境状态从旧的 `base`/`model_download` 说明更新为当前主用 conda 环境 `model`。
+  - 记录 `model` 环境 Python、`torch`、`transformers`、`pyarrow` 和 `pandas` 版本。
+  - 记录当前 `nvidia-smi` 仍失败、`torch.cuda.is_available()` 为 `False`，正式 GPU 推理前仍需修复 GPU driver 或设备节点。
+  - 记录 `RULER/benchmark_root/parquet_data/synthetic/` 已经存在，覆盖 117 个 `validation.jsonl` 输入文件。
+  - 记录 `RULER/benchmark_root/local_eval/` 已经有四模型 4k 输出目录、日志、部分预测、timing 和 `ruler_results_4k_all_models.xlsx`，但结果不完整，复用前需要检查。
+  - 将推荐命令统一改为 `conda run --no-capture-output -n model ...`。
+  - 将四模型 4k runner 示例更新为 GPU `0,2,3,5`、`--max-workers 4`、`--auto-evaluate` 和 `ruler_results_4k_all_models.xlsx`。
+  - 补充 `tools/count_ruler_samples.py` 和 `ruler_sample_counts_4k_64k.csv` 的说明和运行命令。
+
+- `CODEX_CHANGES.md`
+  - 记录本次 `AGENTS.md` 环境和命令更新。
+
+### 变更目的
+
+本次变更用于让协作说明和当前服务器实际状态一致，避免后续继续使用 `<ruler-env>`、`dl-a800`、`ruler-glm44` 或旧 GPU 列表命令。当前文档明确说明：脚本运行默认使用 `model` 环境，输入 jsonl 已经转换完成，但 GPU driver/CUDA 可用性仍是正式推理前的阻塞。
+
+### 主要函数和类
+
+本次只修改文档，没有新增或修改函数、类。
+
+### 运行方式
+
+当前四模型 4k 续跑和自动汇总命令已更新为：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --model Qwen2.5-7B-Instruct-1M=../../models/Qwen2.5-7B-Instruct-1M \
+  --model Yi-9B-200K=../../models/Yi-9B-200K \
+  --model GLM-4-9B-Chat-1M=../../models/GLM-4-9B-Chat-1M \
+  --seq-lengths 4096 \
+  --tasks all \
+  --gpus 0,2,3,5 \
+  --max-workers 4 \
+  --server-type hf \
+  --batch-size 1 \
+  --poll-interval 10 \
+  --log-batch-progress \
+  --auto-evaluate \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_all_models.xlsx \
+  --skip-existing
+```
+
+### 测试和验证
+
+本次环境和文档检查使用的命令：
+
+```bash
+hostname
+conda env list
+conda run --no-capture-output -n model python -c "import sys, torch, transformers, pyarrow, pandas, nltk, yaml; print(sys.executable); print(sys.version.split()[0]); print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('torch_cuda', torch.version.cuda); print('transformers', transformers.__version__); print('pyarrow', pyarrow.__version__); print('pandas', pandas.__version__)"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader
+find RULER/benchmark_root/parquet_data/synthetic -path '*/data/*/validation.jsonl' | wc -l
+find RULER/benchmark_root/local_eval -path '*/synthetic/4096/pred/*.jsonl' | wc -l
+find RULER/benchmark_root/local_eval -path '*/synthetic/4096/logs/*.log' | wc -l
+```
+
+### 假设和限制
+
+- `model` 环境可以用于脚本检查、数据转换、统计和 dry-run；由于当前 CUDA 不可用，不能据此确认 GPU 推理已经可运行。
+- 当前 `local_eval` 下已有的 4k 输出不完整，文档中不把它描述为最终有效测评结果。
+- 旧环境名仅保留在“旧命令需要替换”的提醒中，不再作为推荐命令出现。
+
 ## 2026-05-20 新增 RULER 样本数统计脚本
 
 ### 变更文件
