@@ -1,5 +1,105 @@
 # CODEX 变更说明
 
+## 2026-05-20 新增 RULER 样本数统计脚本
+
+### 变更文件
+
+- `tools/count_ruler_samples.py`
+  - 新增 RULER 转换后 jsonl 输入样本数统计脚本。
+  - 默认统计 `4096`、`8192`、`16384`、`32768`、`65536` 五个长度。
+  - 默认覆盖 13 个 synthetic 任务，并读取 `validation.jsonl`。
+  - 支持 `table`、`csv` 和 `json` 三种输出格式。
+
+- `tests/test_count_ruler_samples.py`
+  - 新增样本数统计脚本的单元测试。
+  - 覆盖长度解析、缺失文件标记、表格输出和 CSV 输出。
+
+- `ruler_sample_counts_4k_64k.csv`
+  - 新增一次当前工作区 4k 到 64k 样本数统计输出。
+  - 每行对应一个任务，每列对应一个长度，最后一列为任务总样本数。
+
+- `CODEX_CHANGES.md`
+  - 记录本次脚本、测试和统计输出变更。
+
+### 变更目的
+
+本次变更用于快速查看当前 RULER 4k 到 64k 转换后输入数据中，每个任务在每个长度下有多少条测试样本。脚本读取 runner 实际使用的 jsonl 输入目录，避免重新读取原始 parquet 或依赖 `pyarrow`。
+
+### 主要函数和类
+
+- `parse_length_value`
+  - 将 `4k`、`64k`、`4096` 等长度写法转换为 token 数。
+- `parse_lengths`
+  - 解析逗号分隔长度列表。
+- `parse_tasks`
+  - 解析任务列表，支持 `all`。
+- `collect_counts`
+  - 收集每个任务在各长度上的 jsonl 非空行数。
+- `format_table`
+  - 输出终端可读表格。
+- `format_csv`
+  - 输出 CSV 文本。
+- `format_json`
+  - 输出 JSON 文本。
+- `main`
+  - 命令行入口。
+
+### 运行方式
+
+默认以终端表格展示当前 4k 到 64k 样本数：
+
+```bash
+cd /data/czy/ICLR-2027
+python -B tools/count_ruler_samples.py
+```
+
+生成 CSV 文件：
+
+```bash
+cd /data/czy/ICLR-2027
+python -B tools/count_ruler_samples.py --format csv > ruler_sample_counts_4k_64k.csv
+```
+
+指定长度、任务或输出格式：
+
+```bash
+python -B tools/count_ruler_samples.py \
+  --lengths 4k,8k,64k \
+  --tasks niah_single_1,qa_2 \
+  --format json
+```
+
+### 测试和验证
+
+本次运行的验证命令：
+
+```bash
+python -B -m unittest tests.test_count_ruler_samples
+conda run --no-capture-output -n model python -B -m unittest tests.test_count_ruler_samples
+python -B -m py_compile tools/count_ruler_samples.py
+python -B tools/count_ruler_samples.py
+python -B tools/count_ruler_samples.py --format json --tasks niah_single_1 --lengths 4k,64k
+python -B tools/count_ruler_samples.py --format csv > ruler_sample_counts_4k_64k.csv
+git diff --check
+git -C RULER diff --check
+git status --short
+git -C RULER status --short
+```
+
+新增单测在 `base` 和 `model` 环境中均通过。当前 `base` 环境运行全量测试：
+
+```bash
+python -B -m unittest discover -s tests
+```
+
+会因环境缺少 `numpy`、`yaml` 和 `torch` 在既有测试上失败，与本次新增脚本无关。
+
+### 假设和限制
+
+- 脚本统计的是 `RULER/benchmark_root/parquet_data/synthetic/` 下转换后的 jsonl 输入，不直接统计原始 parquet。
+- 缺失的 jsonl 文件在输出中显示为 `MISSING`，不会被当成 0。
+- 样本数按非空行统计，不校验每行 JSON 内容是否合法。
+
 ## 2026-05-19 记录新服务器状态并删除旧文档入口
 
 ### 变更文件

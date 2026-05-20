@@ -14,18 +14,24 @@
 6. 评分：`RULER/scripts/eval/evaluate.py`
 7. 统一汇总：`RULER/scripts/eval/collect_results.py`
 
-截至 2026-05-19，当前工作区已经迁移到新服务器，路径为 `/data/czy/ICLR-2027`。旧说明中的 `/home/test05/czyprojects`、`dl-a800` 和 `ruler-glm44` 不再适用。当前 conda 只可见 `base` 和 `model_download`，这两个环境都没有安装完整 RULER 推理依赖，暂不能直接运行本地 Hugging Face 推理测评。
+截至 2026-05-20，当前工作区已经迁移到新服务器，路径为 `/data/czy/ICLR-2027`。旧说明中的 `/home/test05/czyprojects`、`dl-a800` 和 `ruler-glm44` 不再适用。当前主要 RULER 环境是 conda 环境 `model`，命令示例应优先使用 `conda run --no-capture-output -n model ...`。
 
 当前状态摘要：
 
 - 当前主机名：`dilab`。
 - 当前 conda：`/data/czy/miniconda3/bin/conda`。
 - 当前 Python：`/data/czy/miniconda3/bin/python`，版本 `Python 3.13.13`。
-- 当前可见 conda 环境：`base`、`model_download`。
-- `base` 和 `model_download` 当前都不能导入 `torch`。
+- 当前可见 conda 环境：`base`、`data`、`model`、`model_download`。
+- 当前 RULER 主环境：`/data/czy/miniconda3/envs/model/bin/python`，Python `3.10.20`。
+- `model` 环境当前可导入 `torch`、`transformers`、`pyarrow`、`pandas`、`nltk`、`yaml`、`nemo`、`accelerate`、`safetensors`、`sentencepiece` 和 `numpy`。
+- `model` 环境当前关键版本：`torch 2.4.1+cu121`、`torch.version.cuda 12.1`、`transformers 4.47.1`、`pyarrow 24.0.0`、`pandas 2.3.3`。
+- `model` 环境当前不能导入 `openpyxl`，但本地 `RULER/scripts/eval/collect_results.py` 自带 xlsx 写出逻辑，不依赖 `openpyxl`。
 - `nvidia-smi` 当前无法和 NVIDIA driver 通信，GPU 状态需要重新确认。
-- `RULER/benchmark_root/` 当前不存在，因此已转换 jsonl 输入、预测输出、评分输出和 timing 文件都还没有在新服务器上生成。
+- `model` 环境中 `torch.cuda.is_available()` 当前为 `False`，正式 GPU 推理前仍需修复 NVIDIA driver 或设备节点。
+- `RULER/benchmark_root/parquet_data/synthetic/` 当前已经存在，覆盖 9 个长度和 13 个任务，共 117 个 `validation.jsonl` 输入文件。
+- `RULER/benchmark_root/local_eval/` 当前已经存在，包含四个模型的 4k 输出目录、52 个任务日志、11 个预测 jsonl、`ruler_timing.jsonl` 和 `ruler_results_4k_all_models.xlsx`；这是一份不完整或曾失败的 4k 运行结果，复用前应检查日志和预测文件完整性。
 - `benchmark/RULER-llama3-1M/` 当前存在 117 个任务长度目录，覆盖 9 个长度和 13 个 synthetic 任务；共有 118 个 `validation-*.parquet`，其中 `qa_1_1M` 有两个 parquet 分片。
+- `ruler_sample_counts_4k_64k.csv` 当前记录了 4k、8k、16k、32k、64k 各任务样本数；这五个长度下 13 个任务均为每任务每长度 500 条。
 - 根目录 `README.md` 已按用户要求删除，后续由用户重新整理。
 - `RULER/docker/` 已按用户要求删除；当前不再维护上游旧 Docker 模板。
 
@@ -88,6 +94,10 @@
   - 本地辅助诊断脚本，不属于 RULER 原生流程。
   - `tools/dump_llama_attention.py` 用于对一个 Llama 样本导出生成阶段的完整 attention。
   - `tools/inspect_attention_dump.py` 用于查看某个生成 token、某一层、某个 head 的完整 attention 分布表格。
+  - `tools/count_ruler_samples.py` 用于统计转换后 RULER jsonl 输入中，4k 到 64k 各长度、各任务的样本数。
+- `ruler_sample_counts_4k_64k.csv`
+  - 当前工作区 4k、8k、16k、32k、64k 样本数统计输出。
+  - 每行对应一个任务，每列对应一个长度，当前 13 个任务每个长度均为 500 条。
 
 ### RULER 关键目录和脚本
 
@@ -125,10 +135,10 @@
   - 输出单个 `ruler_results.xlsx`，包含 `detail`、`summary_by_model`、`summary_by_model_and_length`、`summary_by_task` 和 `run_info`。
 - `RULER/benchmark_root/parquet_data/synthetic/`
   - `RULER/scripts/data/prepare_parquet.py` 生成的 RULER jsonl 输入数据。
-  - 当前新服务器上该目录不存在，需要配置环境后重新转换。
+  - 当前新服务器上该目录已经存在，包含 117 个 `validation.jsonl` 输入文件。
 - `RULER/benchmark_root/local_eval/`
   - `RULER/scripts/run_parquet_parallel.py` 生成的预测、日志和后续评分结果。
-  - 当前新服务器上该目录不存在，需要重新运行预测后生成。
+  - 当前新服务器上该目录已经存在，但 4k 四模型运行结果不完整；继续实验前应按任务日志和预测行数检查是否需要 `--skip-existing` 续跑或 `--overwrite-existing` 覆盖重跑。
 
 ## 数据来源与格式
 
@@ -159,28 +169,28 @@
 
 评分时，`RULER/scripts/eval/evaluate.py` 会比较 `pred` 和 `outputs`，并统计空预测数量。
 
-## 新服务器待配置事项
+## 当前环境状态与剩余阻塞
 
-当前没有可直接使用的 RULER 推理环境。开始正式测评前，需要先完成以下事项：
+当前已经有可用于脚本转换、统计、dry-run 和部分 CPU 侧检查的 RULER 环境 `model`。开始正式 GPU 推理前，仍需处理 GPU driver 或设备节点问题：
 
-1. 创建或指定新的 Python/conda 环境。
-2. 安装 `torch`、`transformers`、`accelerate`、`safetensors`、`sentencepiece`、`pyarrow`、`pandas`、`nltk`、`tqdm`、`yaml` 等基础依赖。
-3. 针对 `Qwen2.5-7B-Instruct-1M`、`GLM-4-9B-Chat-1M`、`Llama-3.1-8B` 和 `Yi-9B-200K` 分别确认所需 `transformers` 版本、`trust_remote_code` 支持和长上下文配置。
-4. 确认 GPU driver、CUDA 和 PyTorch CUDA 可用；当前 `nvidia-smi` 不能正常工作。
-5. 配好环境后，先跑小样本转换和 runner dry-run，再进行正式推理。
+1. `conda run --no-capture-output -n model python ...` 是当前默认命令前缀。
+2. `model` 环境已经安装基础依赖，能导入 `torch`、`transformers`、`pyarrow`、`pandas`、`nltk`、`yaml`、`nemo` 等。
+3. `RULER/benchmark_root/parquet_data/synthetic/` 已经转换完成，通常不需要重新转换。
+4. `nvidia-smi` 当前仍不能和 NVIDIA driver 通信，`torch.cuda.is_available()` 当前为 `False`。正式推理前必须先让 CUDA 可用。
+5. 当前 4k 四模型运行目录已有部分输出和日志，但结果不完整，继续跑时根据目标选择 `--skip-existing` 续跑或 `--overwrite-existing` 干净重跑。
 
-旧命令中所有 `conda run -n dl-a800 ...`、`conda run -n ruler-glm44 ...`、`/home/test05/czyprojects`、`/home/test05/miniconda3/...` 路径都需要替换。新文档示例统一使用 `/data/czy/ICLR-2027` 和占位环境名 `<ruler-env>`。
+旧命令中所有 `conda run -n dl-a800 ...`、`conda run -n ruler-glm44 ...`、`conda run -n <ruler-env> ...`、`/home/test05/czyprojects`、`/home/test05/miniconda3/...` 路径都需要替换。当前文档示例统一使用 `/data/czy/ICLR-2027` 和 conda 环境 `model`。
 
 ## 推荐测评流程
 
 ### 1. 确认环境
 
-当前环境未配置完成。配置完成后，先运行：
+当前默认使用 `model` 环境。正式推理前，先运行：
 
 ```bash
 cd /data/czy/ICLR-2027
-conda run -n <ruler-env> python -c "import torch, transformers, pyarrow, pandas, nltk; print('ok')"
-conda run -n <ruler-env> python -c "import torch; print(torch.cuda.is_available())"
+conda run --no-capture-output -n model python -c "import torch, transformers, pyarrow, pandas, nltk, yaml, nemo; print('ok')"
+conda run --no-capture-output -n model python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 nvidia-smi
 ```
 
@@ -188,20 +198,20 @@ nvidia-smi
 
 ### 2. 将 parquet 转换成 RULER jsonl
 
-当前 `RULER/benchmark_root/parquet_data/synthetic/` 不存在，配置好环境后需要重新转换。
+当前 `RULER/benchmark_root/parquet_data/synthetic/` 已经存在，通常不需要重新转换。只有原始 parquet 更新、目标 jsonl 缺失，或需要重新生成输入时才运行转换。
 
 转换全部数据：
 
 ```bash
 cd /data/czy/ICLR-2027
-conda run -n <ruler-env> python RULER/scripts/data/prepare_parquet.py
+conda run --no-capture-output -n model python RULER/scripts/data/prepare_parquet.py
 ```
 
 只转换一个任务和一个长度，适合检查流程：
 
 ```bash
 cd /data/czy/ICLR-2027
-conda run -n <ruler-env> python RULER/scripts/data/prepare_parquet.py \
+conda run --no-capture-output -n model python RULER/scripts/data/prepare_parquet.py \
   --tasks niah_single_1 \
   --lengths 4k \
   --max_samples 5 \
@@ -225,7 +235,7 @@ conda run -n <ruler-env> python RULER/scripts/data/prepare_parquet.py \
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-conda run -n <ruler-env> python -B run_parquet_parallel.py \
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model Llama-3.1-8B=../../models/Llama-3.1-8B \
   --seq-lengths 4096 \
   --tasks niah_single_1 \
@@ -270,13 +280,13 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 
 ### 4. 正式运行预测
 
-配置好环境、转换好 jsonl 并确认 GPU 可用后，再运行预测。
+确认 `model` 环境、转换后 jsonl 和 GPU 可用后，再运行预测。
 
 跑单模型、单长度、单任务：
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-conda run -n <ruler-env> python run_parquet_parallel.py \
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model Llama-3.1-8B=../../models/Llama-3.1-8B \
   --seq-lengths 4096 \
   --tasks niah_single_1 \
@@ -290,25 +300,30 @@ conda run -n <ruler-env> python run_parquet_parallel.py \
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-conda run -n <ruler-env> python run_parquet_parallel.py \
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model Llama-3.1-8B=../../models/Llama-3.1-8B \
   --model Qwen2.5-7B-Instruct-1M=../../models/Qwen2.5-7B-Instruct-1M \
   --model Yi-9B-200K=../../models/Yi-9B-200K \
   --model GLM-4-9B-Chat-1M=../../models/GLM-4-9B-Chat-1M \
   --seq-lengths 4096 \
   --tasks all \
-  --gpus 0,1,2,3 \
+  --gpus 0,2,3,5 \
+  --max-workers 4 \
   --server-type hf \
   --batch-size 1 \
   --poll-interval 10 \
   --log-batch-progress \
+  --auto-evaluate \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_all_models.xlsx \
   --skip-existing
 ```
+
+如果要使用此前确认可运行的较大 batch，可以把 `--batch-size 1` 改成 `--batch-size 15`。如果要覆盖旧结果，应删除 `--skip-existing` 并改用 `--overwrite-existing`。
 
 如果某个模型需要独立 Python，使用 `--model-python`：
 
 ```bash
-  --python /data/czy/miniconda3/envs/<ruler-env>/bin/python \
+  --python /data/czy/miniconda3/envs/model/bin/python \
   --model-python GLM-4-9B-Chat-1M=/data/czy/miniconda3/envs/<glm-env>/bin/python
 ```
 
@@ -320,7 +335,7 @@ conda run -n <ruler-env> python run_parquet_parallel.py \
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
-CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n <ruler-env> python -u pred/call_api.py \
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u pred/call_api.py \
   --data_dir ../benchmark_root/parquet_data/synthetic/4096/data \
   --save_dir ../benchmark_root/local_eval/Llama-3.1-8B/synthetic/4096/pred \
   --benchmark synthetic \
