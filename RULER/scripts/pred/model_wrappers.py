@@ -96,7 +96,12 @@ def summarize_attention_layers(
     return layers
 
 
-def compute_generation_ppl_stats(scores: Sequence[torch.Tensor], generated_token_ids: torch.Tensor) -> dict:
+def compute_generation_ppl_stats(
+    scores: Sequence[torch.Tensor],
+    generated_token_ids: torch.Tensor,
+    tokenizer=None,
+    include_token_details: bool = False,
+) -> dict:
     """基于 generate 返回的逐步 scores 计算单条样本的生成 token PPL。"""
 
     if generated_token_ids.dim() == 2:
@@ -106,41 +111,76 @@ def compute_generation_ppl_stats(scores: Sequence[torch.Tensor], generated_token
 
     token_count = min(len(scores), int(generated_token_ids.numel()))
     if token_count == 0:
-        return {
+        stats = {
             "generation_logprob_sum": 0.0,
             "generation_token_count": 0,
             "generation_nll": None,
             "generation_ppl": None,
         }
+        if include_token_details:
+            stats["generation_tokens"] = []
+        return stats
 
     logprob_sum = 0.0
+    token_details = []
     for step_idx in range(token_count):
         step_scores = scores[step_idx]
         if step_scores.dim() == 2:
             step_scores = step_scores[0]
         token_id = int(generated_token_ids[step_idx].item())
         step_logprobs = torch.log_softmax(step_scores.float(), dim=-1)
-        logprob_sum += float(step_logprobs[token_id].item())
+        token_logprob = float(step_logprobs[token_id].item())
+        logprob_sum += token_logprob
+        if include_token_details:
+            token_text = str(token_id)
+            if tokenizer is not None:
+                try:
+                    token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+                except Exception:
+                    token_text = str(token_id)
+            token_nll = -token_logprob
+            token_details.append(
+                {
+                    "position": step_idx,
+                    "token_id": token_id,
+                    "token": token_text,
+                    "logprob": token_logprob,
+                    "nll": token_nll,
+                    "ppl": math.exp(token_nll),
+                }
+            )
 
     nll = -logprob_sum / token_count
-    return {
+    stats = {
         "generation_logprob_sum": logprob_sum,
         "generation_token_count": token_count,
         "generation_nll": nll,
         "generation_ppl": math.exp(nll),
     }
+    if include_token_details:
+        stats["generation_tokens"] = token_details
+    return stats
 
 
 def compute_batch_generation_ppl_stats(
     scores: Sequence[torch.Tensor],
     generated_token_ids: torch.Tensor,
+    tokenizer=None,
+    include_token_details: bool = False,
 ) -> List[dict]:
     """基于 generate scores 为 batch 中每条样本分别计算生成 token PPL。"""
 
     stats = []
     for sample_idx in range(generated_token_ids.shape[0]):
         sample_scores = [step_scores[sample_idx:sample_idx + 1] for step_scores in scores]
-        stats.append(compute_generation_ppl_stats(sample_scores, generated_token_ids[sample_idx:sample_idx + 1]))
+        stats.append(
+            compute_generation_ppl_stats(
+                sample_scores,
+                generated_token_ids[sample_idx:sample_idx + 1],
+                tokenizer=tokenizer,
+                include_token_details=include_token_details,
+            )
+        )
     return stats
 
 
@@ -150,6 +190,9 @@ class HuggingFaceModel:
 
         self.log_attention_scores = bool(generation_kwargs.pop("log_attention_scores", False))
         self.log_generation_ppl = bool(generation_kwargs.pop("log_generation_ppl", False))
+        self.log_generation_token_ppl = bool(generation_kwargs.pop("log_generation_token_ppl", False))
+        if self.log_generation_token_ppl:
+            self.log_generation_ppl = True
         self.attention_top_k = int(generation_kwargs.pop("attention_top_k", 8))
         self.tokenizer = AutoTokenizer.from_pretrained(name_or_path, trust_remote_code=True)
 
@@ -241,7 +284,12 @@ class HuggingFaceModel:
         if self.log_generation_ppl:
             input_length = inputs["input_ids"].shape[1]
             generated_token_ids = generated_ids[:, input_length:]
-            ppl_stats = compute_batch_generation_ppl_stats(generated_output.scores, generated_token_ids)
+            ppl_stats = compute_batch_generation_ppl_stats(
+                generated_output.scores,
+                generated_token_ids,
+                tokenizer=self.tokenizer,
+                include_token_details=self.log_generation_token_ppl,
+            )
 
         for result_idx, (text, prompt) in enumerate(zip(generated_texts, prompts)):
             # remove the input form the generated text
@@ -291,7 +339,14 @@ class HuggingFaceModel:
         )
         result = {"text": [text], "attention": attention_summary}
         if self.log_generation_ppl:
-            result.update(compute_generation_ppl_stats(generated_ids.scores, new_token_ids.reshape(1, -1)))
+            result.update(
+                compute_generation_ppl_stats(
+                    generated_ids.scores,
+                    new_token_ids.reshape(1, -1),
+                    tokenizer=self.tokenizer,
+                    include_token_details=self.log_generation_token_ppl,
+                )
+            )
         return result
 
     def _summarize_first_generated_token_attention(self, inputs, sequence: torch.Tensor, input_length: int) -> dict:

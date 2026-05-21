@@ -94,6 +94,7 @@ parser.add_argument("--max_retries", type=int, default=3, help="单个 batch 推
 parser.add_argument("--log_attention_scores", action="store_true", help="输出 Hugging Face 模型逐层注意力摘要。")
 parser.add_argument("--attention_top_k", type=int, default=8, help="每层注意力摘要保留分数最高的 token 数量。")
 parser.add_argument("--log_generation_ppl", action="store_true", help="输出 Hugging Face 生成答案 token 的 PPL。")
+parser.add_argument("--log_generation_token_ppl", action="store_true", help="额外输出 Hugging Face 每个生成 token 的 PPL 明细。")
 
 args = parser.parse_args()
 if args.max_retries <= 0:
@@ -102,8 +103,10 @@ if args.attention_top_k <= 0:
     raise ValueError("--attention_top_k 必须是正整数")
 if args.log_attention_scores and args.server_type != "hf":
     raise ValueError("--log_attention_scores 目前只支持 --server_type hf")
-if args.log_generation_ppl and args.server_type != "hf":
-    raise ValueError("--log_generation_ppl 目前只支持 --server_type hf")
+if (args.log_generation_ppl or args.log_generation_token_ppl) and args.server_type != "hf":
+    raise ValueError("--log_generation_ppl 和 --log_generation_token_ppl 目前只支持 --server_type hf")
+if args.log_generation_token_ppl:
+    args.log_generation_ppl = True
 args.stop_words = list(filter(None, args.stop_words.split(',')))
 if args.server_type == 'hf' or args.server_type == 'gemini':
     args.threads = 1
@@ -194,6 +197,7 @@ def get_llm(tokens_to_generate):
             log_attention_scores=args.log_attention_scores,
             attention_top_k=args.attention_top_k,
             log_generation_ppl=args.log_generation_ppl,
+            log_generation_token_ppl=args.log_generation_token_ppl,
         )
     
     elif args.server_type == 'mamba':
@@ -344,6 +348,20 @@ def build_prediction_record(pred, index, input_text, outputs, others, truncation
     return record
 
 
+def build_generation_token_record(pred, index, task):
+    """把模型返回的逐 token 生成 PPL 明细转换成 sidecar jsonl 记录。"""
+
+    tokens = []
+    if isinstance(pred, dict):
+        tokens = pred.get("generation_tokens") or []
+    return {
+        "index": index,
+        "task": task,
+        "generation_token_count": len(tokens),
+        "tokens": tokens,
+    }
+
+
 def main():
     start_time = time.time()
     
@@ -429,6 +447,12 @@ def main():
                     "task": args.task,
                     "attention": pred["attention"],
                 }
+            if isinstance(pred, dict) and pred.get("generation_tokens") is not None:
+                generation_token_parallel[idx] = build_generation_token_record(
+                    pred=pred,
+                    index=index,
+                    task=args.task,
+                )
 
         if args.log_batch_progress:
             elapsed = time.time() - batch_meta['started_at']
@@ -446,6 +470,7 @@ def main():
     worker_error_lock = threading.Lock()
     outputs_parallel = [{} for _ in range(len(data))]
     attention_parallel = [{} for _ in range(len(data))]
+    generation_token_parallel = [{} for _ in range(len(data))]
 
     batched_data = []
     batch = []
@@ -463,6 +488,7 @@ def main():
 
     attention_jsonl_file = pred_file.with_suffix(".attention.jsonl")
     attention_markdown_file = pred_file.with_suffix(".attention.md")
+    generation_token_jsonl_file = pred_file.with_suffix(".generation_tokens.jsonl")
     write_attention_header = (
         args.log_attention_scores
         and (not attention_markdown_file.exists() or attention_markdown_file.stat().st_size == 0)
@@ -473,12 +499,16 @@ def main():
         fout = stack.enter_context(open(pred_file, 'at', encoding="utf-8", buffering=1))
         attention_jsonl = None
         attention_markdown = None
+        generation_token_jsonl = None
         if args.log_attention_scores:
             attention_jsonl = stack.enter_context(open(attention_jsonl_file, 'at', encoding="utf-8", buffering=1))
             attention_markdown = stack.enter_context(open(attention_markdown_file, 'at', encoding="utf-8", buffering=1))
             if write_attention_header:
                 attention_markdown.write(f"# {args.task} 注意力摘要\n\n")
             print(f"Attention summaries to {attention_markdown_file} and {attention_jsonl_file}", flush=True)
+        if args.log_generation_token_ppl:
+            generation_token_jsonl = stack.enter_context(open(generation_token_jsonl_file, 'at', encoding="utf-8", buffering=1))
+            print(f"生成 token PPL 明细写入 {generation_token_jsonl_file}", flush=True)
 
         # the data is processed sequentially, so we can store the start and end of current processing window
         start_idx = 0  # window: [start_idx, end_idx]
@@ -543,6 +573,8 @@ def main():
                             )
                             + "\n\n"
                         )
+                    if generation_token_jsonl is not None and len(generation_token_parallel[idx]) > 0:
+                        generation_token_jsonl.write(json.dumps(generation_token_parallel[idx], ensure_ascii=False) + '\n')
 
                 start_idx = end_idx + 1
 

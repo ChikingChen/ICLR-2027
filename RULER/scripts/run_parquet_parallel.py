@@ -80,6 +80,7 @@ class RunnerConfig(NamedTuple):
     log_attention_scores: bool
     attention_top_k: int
     log_generation_ppl: bool
+    log_generation_token_ppl: bool
     overwrite_existing: bool
     timing_file: Path
     auto_evaluate: bool
@@ -245,6 +246,7 @@ def overwrite_files_for(job: Job, config: RunnerConfig) -> List[Path]:
         pred_file,
         pred_file.with_suffix(".attention.jsonl"),
         pred_file.with_suffix(".attention.md"),
+        pred_file.with_suffix(".generation_tokens.jsonl"),
         log_file_for(job, config),
     ]
 
@@ -316,6 +318,8 @@ def build_call_api_command(job: Job, config: RunnerConfig) -> List[str]:
         command.extend(["--attention_top_k", str(config.attention_top_k)])
     if config.log_generation_ppl:
         command.append("--log_generation_ppl")
+    if config.log_generation_token_ppl:
+        command.append("--log_generation_token_ppl")
     return command
 
 
@@ -417,6 +421,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="让 Hugging Face 子进程在生成阶段记录生成 token 的 PPL 字段。",
     )
     parser.add_argument(
+        "--log-generation-token-ppl",
+        action="store_true",
+        help="让 Hugging Face 子进程额外写出每个生成 token 的 PPL 明细。",
+    )
+    parser.add_argument(
         "--timing-file",
         type=Path,
         help="结构化任务耗时 jsonl；默认写到 output-root/ruler_timing.jsonl。",
@@ -477,7 +486,8 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         log_batch_progress=args.log_batch_progress,
         log_attention_scores=args.log_attention_scores,
         attention_top_k=args.attention_top_k,
-        log_generation_ppl=args.log_generation_ppl,
+        log_generation_ppl=args.log_generation_ppl or args.log_generation_token_ppl,
+        log_generation_token_ppl=args.log_generation_token_ppl,
         overwrite_existing=args.overwrite_existing,
         timing_file=timing_file,
         auto_evaluate=args.auto_evaluate,
