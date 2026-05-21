@@ -1,5 +1,107 @@
 # CODEX 变更说明
 
+## 2026-05-20 新增 RULER 20 条固定随机子数据集划分脚本
+
+### 变更文件
+
+- `tools/slice_ruler_dataset.py`
+  - 新增 RULER jsonl 子数据集划分脚本。
+  - 默认从 `RULER/benchmark_root/parquet_data/synthetic` 读取 4k 到 64k 的 13 个 synthetic 任务。
+  - 默认每个任务长度用固定随机种子 `0` 抽取 20 条，写入 `RULER/benchmark_root/parquet_data_20/synthetic`。
+  - 写出 `subset_report.json`，记录源文件、目标文件、源行数、写出行数、随机种子、抽中的原始行号和样本 `index`。
+
+- `tests/test_slice_ruler_dataset.py`
+  - 新增子数据集划分脚本单元测试。
+  - 覆盖固定随机抽样、输出顺序、源文件不变、runner 兼容目录结构、划分报告和样本数不足报错。
+
+- `CODEX_CHANGES.md`
+  - 记录本次脚本、测试、运行方式和限制。
+
+### 变更目的
+
+本次变更用于在不改动原始 RULER 输入数据的前提下，快速复制出一个小样本评测集。新子数据集保留 runner 需要的目录结构，因此后续只需要把 `run_parquet_parallel.py` 的 `--data-root` 指向新目录即可用四个本地模型运行。
+
+### 主要函数和类
+
+- `parse_lengths`
+  - 解析长度参数，默认 `all` 表示 `4096,8192,16384,32768,65536`。
+- `parse_task_csv`
+  - 解析任务参数，默认 `all` 表示 13 个 synthetic 任务。
+- `slice_jsonl_file`
+  - 从单个 jsonl 文件中固定随机抽样，并按原文件行顺序复制到目标文件。
+- `slice_dataset`
+  - 按长度和任务矩阵批量复制子数据集，并写出 `subset_report.json`。
+- `main`
+  - 命令行入口。
+
+### 运行方式
+
+生成默认 20 条子数据集：
+
+```bash
+cd /data/czy/ICLR-2027
+conda run --no-capture-output -n model python -B tools/slice_ruler_dataset.py
+```
+
+子数据集输出位置：
+
+```text
+/data/czy/ICLR-2027/RULER/benchmark_root/parquet_data_20/synthetic
+```
+
+使用四个模型运行该子数据集：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --model Qwen2.5-7B-Instruct-1M=../../models/Qwen2.5-7B-Instruct-1M \
+  --model Yi-9B-200K=../../models/Yi-9B-200K \
+  --model GLM-4-9B-Chat-1M=../../models/GLM-4-9B-Chat-1M \
+  --seq-lengths 4096,8192,16384,32768,65536 \
+  --tasks all \
+  --gpus 0,2,3,5 \
+  --max-workers 4 \
+  --data-root ../benchmark_root/parquet_data_20/synthetic \
+  --output-root ../benchmark_root/local_eval_20 \
+  --server-type hf \
+  --batch-size 1 \
+  --poll-interval 10 \
+  --log-batch-progress \
+  --auto-evaluate \
+  --report-file ../benchmark_root/local_eval_20/ruler_results_4k_64k_20samples_all_models.xlsx \
+  --skip-existing
+```
+
+### 测试和验证
+
+本次需要运行的验证命令：
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests/test_slice_ruler_dataset.py
+conda run --no-capture-output -n model python -B -m unittest discover -s tests
+conda run --no-capture-output -n model python -B -m py_compile tools/slice_ruler_dataset.py RULER/scripts/run_parquet_parallel.py
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --data-root ../benchmark_root/parquet_data_20/synthetic \
+  --output-root ../benchmark_root/local_eval_20 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --dry-run
+```
+
+### 假设和限制
+
+- 默认固定随机种子为 `0`，同一源数据下重复运行会抽到同一批样本。
+- 默认覆盖 4k、8k、16k、32k、64k，不包含 128k 及以上长度。
+- 脚本只复制已有 jsonl 行，不重新生成 prompt，不读取原始 parquet。
+- 运行四模型命令前仍需确认 GPU 和 CUDA 可用。
+
 ## 2026-05-20 更新当前 model 环境和 RULER 命令说明
 
 ### 变更文件
