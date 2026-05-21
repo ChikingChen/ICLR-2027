@@ -1,15 +1,13 @@
 import importlib.util
+import csv
 import json
 import math
 import tempfile
 import unittest
-import zipfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "RULER" / "scripts" / "eval" / "collect_results.py"
-NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
 
 def _load_module():
@@ -27,23 +25,13 @@ def _write_jsonl(path, rows):
     )
 
 
-def _shared_strings(xlsx_path):
-    with zipfile.ZipFile(xlsx_path) as archive:
-        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-    values = []
-    for item in root.findall("main:si", NS):
-        values.append("".join(node.text or "" for node in item.findall(".//main:t", NS)))
-    return values
-
-
-def _sheet_names(xlsx_path):
-    with zipfile.ZipFile(xlsx_path) as archive:
-        root = ET.fromstring(archive.read("xl/workbook.xml"))
-    return [sheet.attrib["name"] for sheet in root.findall("main:sheets/main:sheet", NS)]
+def _read_csv(path):
+    with path.open("r", encoding="utf-8", newline="") as file_obj:
+        return list(csv.DictReader(file_obj))
 
 
 class CollectResultsTest(unittest.TestCase):
-    """验证 RULER 汇总脚本的明细、聚合和 xlsx 输出。"""
+    """验证 RULER 汇总脚本的明细、聚合和 csv 输出。"""
 
     def _make_fixture(self, root):
         output_root = root / "local_eval"
@@ -159,11 +147,11 @@ class CollectResultsTest(unittest.TestCase):
             self.assertEqual(summary["total_task_elapsed_seconds"], 12.5)
             self.assertEqual(summary["wall_time_seconds"], 12.5)
 
-    def test_xlsx_contains_summary_by_model_and_length_sheet(self):
+    def test_csv_writes_detail_and_summary_files(self):
         module = _load_module()
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_root, data_root, timing_file = self._make_fixture(Path(tmp_dir))
-            output_file = Path(tmp_dir) / "results.xlsx"
+            output_file = Path(tmp_dir) / "results.csv"
 
             module.main(
                 [
@@ -184,8 +172,70 @@ class CollectResultsTest(unittest.TestCase):
                 ]
             )
 
-            self.assertIn("summary_by_model_and_length", _sheet_names(output_file))
-            self.assertIn("summary_by_model_and_length", _shared_strings(output_file))
+            detail_rows = _read_csv(output_file)
+            self.assertEqual(detail_rows[0]["model"], "model-a")
+            self.assertEqual(detail_rows[0]["task"], "niah_single_1")
+            self.assertEqual(detail_rows[0]["status"], "completed")
+
+            summary_file = Path(tmp_dir) / "results_summary_by_model_and_length.csv"
+            self.assertTrue(summary_file.exists())
+            summary_rows = _read_csv(summary_file)
+            self.assertEqual(summary_rows[0]["model"], "model-a")
+            self.assertEqual(summary_rows[0]["length"], "4096")
+
+            expected_files = {
+                "results_summary_by_model.csv",
+                "results_summary_by_model_and_length.csv",
+                "results_summary_by_task.csv",
+                "results_run_info.csv",
+            }
+            self.assertTrue(expected_files.issubset({path.name for path in Path(tmp_dir).glob("*.csv")}))
+
+    def test_xlsx_output_file_is_rejected(self):
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_root, data_root, timing_file = self._make_fixture(Path(tmp_dir))
+            output_file = Path(tmp_dir) / "results.xlsx"
+
+            with self.assertRaisesRegex(ValueError, r"\.csv"):
+                module.main(
+                    [
+                        "--output-root",
+                        str(output_root),
+                        "--data-root",
+                        str(data_root),
+                        "--models",
+                        "model-a",
+                        "--seq-lengths",
+                        "4096",
+                        "--tasks",
+                        "niah_single_1,qa_1",
+                        "--timing-file",
+                        str(timing_file),
+                        "--output-file",
+                        str(output_file),
+                    ]
+                )
+
+    def test_xlsx_output_file_is_rejected_before_data_discovery(self):
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            output_file = root / "results.xlsx"
+
+            with self.assertRaisesRegex(ValueError, r"\.csv"):
+                module.main(
+                    [
+                        "--output-root",
+                        str(root / "missing_local_eval"),
+                        "--data-root",
+                        str(root / "missing_data_root"),
+                        "--models",
+                        "model-a",
+                        "--output-file",
+                        str(output_file),
+                    ]
+                )
 
     def test_generation_ppl_is_aggregated_from_logprob_and_tokens(self):
         module = _load_module()

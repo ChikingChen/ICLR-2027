@@ -24,7 +24,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 RULER_ROOT = SCRIPTS_DIR.parent
 DEFAULT_DATA_ROOT = RULER_ROOT / "benchmark_root" / "parquet_data" / "synthetic"
 DEFAULT_OUTPUT_ROOT = RULER_ROOT / "benchmark_root" / "local_eval"
-DEFAULT_REPORT_NAME = "ruler_results.xlsx"
+DEFAULT_REPORT_NAME = "ruler_results.csv"
 DEFAULT_TIMING_NAME = "ruler_timing.jsonl"
 DEFAULT_TASKS = (
     "niah_single_1",
@@ -424,12 +424,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--auto-evaluate",
         action="store_true",
-        help="全部子任务结束后自动调用 eval/collect_results.py 生成统一 xlsx 汇总。",
+        help="全部子任务结束后自动调用 eval/collect_results.py 生成统一 csv 汇总。",
     )
     parser.add_argument(
         "--report-file",
         type=Path,
-        help="自动汇总 xlsx 输出路径；默认写到 output-root/ruler_results.xlsx。",
+        help="自动汇总 csv 主输出路径；默认写到 output-root/ruler_results.csv。",
     )
     parser.add_argument(
         "--dry-run",
@@ -455,6 +455,8 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         raise ValueError("--attention-top-k 必须是正整数")
     timing_file = args.timing_file if args.timing_file is not None else args.output_root / DEFAULT_TIMING_NAME
     report_file = args.report_file if args.report_file is not None else args.output_root / DEFAULT_REPORT_NAME
+    if report_file.suffix.lower() != ".csv":
+        raise ValueError(f"--report-file 必须使用 .csv 后缀：{report_file}")
 
     return RunnerConfig(
         scripts_dir=selected_scripts_dir,

@@ -312,6 +312,8 @@ class RunParquetParallelTest(unittest.TestCase):
             args.output_root = root / "local_eval"
             config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
 
+            self.assertEqual(config.report_file, args.output_root / "ruler_results.csv")
+
             command = module.build_collect_results_command(
                 config=config,
                 models=["llama"],
@@ -329,6 +331,26 @@ class RunParquetParallelTest(unittest.TestCase):
             self.assertIn(str(config.timing_file), command)
             self.assertIn("--output-file", command)
             self.assertIn(str(config.report_file), command)
+
+    def test_report_file_rejects_xlsx_suffix(self):
+        module = _load_module()
+        args = module.build_parser().parse_args(
+            [
+                "--model",
+                "llama=/models/llama",
+                "--seq-lengths",
+                "4096",
+                "--tasks",
+                "niah_single_1",
+                "--gpus",
+                "0",
+                "--report-file",
+                "results.xlsx",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, r"\.csv"):
+            module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
 
 
 if __name__ == "__main__":

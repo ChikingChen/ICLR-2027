@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""汇总本地 RULER 预测、评分、耗时和生成概率到单个 xlsx 文件。"""
+"""汇总本地 RULER 预测、评分、耗时和生成概率到一组 csv 文件。"""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import importlib.util
 import json
 import math
-import posixpath
 import re
-import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from xml.sax.saxutils import escape
 
 import yaml
 
@@ -132,7 +130,7 @@ def default_data_root() -> Path:
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行参数解析器。"""
 
-    parser = argparse.ArgumentParser(description="统一汇总 RULER 本地预测结果为 xlsx。")
+    parser = argparse.ArgumentParser(description="统一汇总 RULER 本地预测结果为 csv。")
     parser.add_argument("--output-root", type=Path, default=default_output_root())
     parser.add_argument("--data-root", type=Path, default=default_data_root())
     parser.add_argument("--benchmark", default="synthetic")
@@ -140,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-lengths", default="all", help="逗号分隔长度过滤或 all。")
     parser.add_argument("--tasks", default="all", help="逗号分隔任务过滤或 all。")
     parser.add_argument("--timing-file", type=Path, default=None, help="runner 结构化 timing jsonl。")
-    parser.add_argument("--output-file", type=Path, default=None, help="xlsx 输出路径。")
+    parser.add_argument("--output-file", type=Path, default=None, help="csv 主输出路径。")
     return parser
 
 
@@ -524,143 +522,23 @@ def rows_to_matrix(rows: Sequence[Mapping[str, Any]], columns: Sequence[str]) ->
     return [list(columns)] + [[row.get(column, "") for column in columns] for row in rows]
 
 
-def column_letter(index: int) -> str:
-    """把从 1 开始的列序号转换为 Excel 列名。"""
+def csv_file_for_sheet(output_file: Path, sheet_name: str) -> Path:
+    """返回某张汇总表对应的 csv 文件路径。"""
 
-    result = ""
-    while index:
-        index, rem = divmod(index - 1, 26)
-        result = chr(65 + rem) + result
-    return result
+    if sheet_name == "detail":
+        return output_file
+    return output_file.with_name(f"{output_file.stem}_{sheet_name}.csv")
 
 
-def cell_ref(row_index: int, column_index: int) -> str:
-    """返回 Excel 单元格引用。"""
+def validate_csv_output_file(output_file: Path) -> None:
+    """确认输出路径使用 csv 后缀，避免误生成 xlsx 文件。"""
 
-    return f"{column_letter(column_index)}{row_index}"
-
-
-def build_shared_strings(sheets: Mapping[str, Sequence[Sequence[Any]]]) -> Tuple[Dict[str, int], List[str]]:
-    """收集 xlsx 需要的 shared strings。"""
-
-    strings: List[str] = []
-    index: Dict[str, int] = {}
-    for sheet_name, matrix in sheets.items():
-        values = [sheet_name]
-        for row in matrix:
-            values.extend(value for value in row if isinstance(value, str))
-        for value in values:
-            if value not in index:
-                index[value] = len(strings)
-                strings.append(value)
-    return index, strings
+    if output_file.suffix.lower() != ".csv":
+        raise ValueError(f"--output-file 必须使用 .csv 后缀：{output_file}")
 
 
-def sheet_xml(matrix: Sequence[Sequence[Any]], shared_index: Mapping[str, int]) -> str:
-    """生成一个 worksheet XML。"""
-
-    rows_xml = []
-    for row_idx, row in enumerate(matrix, start=1):
-        cells = []
-        for col_idx, value in enumerate(row, start=1):
-            if value is None:
-                continue
-            ref = cell_ref(row_idx, col_idx)
-            if isinstance(value, str):
-                cells.append(f'<c r="{ref}" t="s"><v>{shared_index[value]}</v></c>')
-            else:
-                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
-        rows_xml.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<sheetData>{"".join(rows_xml)}</sheetData>'
-        "</worksheet>"
-    )
-
-
-def shared_strings_xml(strings: Sequence[str]) -> str:
-    """生成 sharedStrings.xml。"""
-
-    items = "".join(f"<si><t>{escape(value)}</t></si>" for value in strings)
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(strings)}" uniqueCount="{len(strings)}">'
-        f"{items}</sst>"
-    )
-
-
-def workbook_xml(sheet_names: Sequence[str]) -> str:
-    """生成 workbook.xml。"""
-
-    sheets = "".join(
-        f'<sheet name="{escape(name)}" sheetId="{idx}" r:id="rId{idx}"/>'
-        for idx, name in enumerate(sheet_names, start=1)
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f"<sheets>{sheets}</sheets></workbook>"
-    )
-
-
-def workbook_rels_xml(sheet_names: Sequence[str]) -> str:
-    """生成 workbook 关系 XML。"""
-
-    rels = []
-    for idx, _ in enumerate(sheet_names, start=1):
-        rels.append(
-            f'<Relationship Id="rId{idx}" '
-            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-            f'Target="worksheets/sheet{idx}.xml"/>'
-        )
-    rels.append(
-        f'<Relationship Id="rId{len(sheet_names) + 1}" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" '
-        'Target="sharedStrings.xml"/>'
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f'{"".join(rels)}</Relationships>'
-    )
-
-
-def root_rels_xml() -> str:
-    """生成根关系 XML。"""
-
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-        "</Relationships>"
-    )
-
-
-def content_types_xml(sheet_count: int) -> str:
-    """生成 xlsx 内容类型 XML。"""
-
-    overrides = [
-        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
-        '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>',
-    ]
-    for idx in range(1, sheet_count + 1):
-        overrides.append(
-            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" '
-            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        )
-    return (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        f'{"".join(overrides)}</Types>'
-    )
-
-
-def write_xlsx(output_file: Path, workbook: Mapping[str, Sequence[Mapping[str, Any]]]) -> None:
-    """用标准库写一个包含 shared strings 的最小 xlsx 文件。"""
+def write_csv(output_file: Path, workbook: Mapping[str, Sequence[Mapping[str, Any]]]) -> List[Path]:
+    """用标准库把五张汇总表写成一组 csv 文件，返回实际写出的路径。"""
 
     sheet_columns = {
         "detail": DETAIL_COLUMNS,
@@ -669,20 +547,16 @@ def write_xlsx(output_file: Path, workbook: Mapping[str, Sequence[Mapping[str, A
         "summary_by_task": SUMMARY_BY_TASK_COLUMNS,
         "run_info": RUN_INFO_COLUMNS,
     }
-    matrices = {
-        sheet_name: rows_to_matrix(workbook[sheet_name], columns)
-        for sheet_name, columns in sheet_columns.items()
-    }
-    shared_index, strings = build_shared_strings(matrices)
+    validate_csv_output_file(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output_file, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types_xml(len(matrices)))
-        archive.writestr("_rels/.rels", root_rels_xml())
-        archive.writestr("xl/workbook.xml", workbook_xml(list(matrices.keys())))
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml(list(matrices.keys())))
-        archive.writestr("xl/sharedStrings.xml", shared_strings_xml(strings))
-        for idx, matrix in enumerate(matrices.values(), start=1):
-            archive.writestr(posixpath.join("xl", "worksheets", f"sheet{idx}.xml"), sheet_xml(matrix, shared_index))
+    written_files: List[Path] = []
+    for sheet_name, columns in sheet_columns.items():
+        csv_file = csv_file_for_sheet(output_file, sheet_name)
+        with csv_file.open("w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerows(rows_to_matrix(workbook[sheet_name], columns))
+        written_files.append(csv_file)
+    return written_files
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -692,7 +566,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     models = parse_csv(args.models) or discover_models(args.output_root, args.benchmark)
     lengths = parse_lengths(args.seq_lengths, args.data_root)
     tasks = resolve_tasks(args.tasks, args.benchmark)
-    output_file = args.output_file or (args.output_root / "ruler_results.xlsx")
+    output_file = args.output_file or (args.output_root / "ruler_results.csv")
     workbook = collect_results(
         output_root=args.output_root,
         data_root=args.data_root,
@@ -702,8 +576,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tasks=tasks,
         timing_file=args.timing_file,
     )
-    write_xlsx(output_file, workbook)
-    print(f"Saved RULER results to {output_file}")
+    written_files = write_csv(output_file, workbook)
+    print(f"Saved RULER results to {', '.join(str(path) for path in written_files)}")
     return 0
 
 

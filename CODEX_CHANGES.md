@@ -1,5 +1,96 @@
 # CODEX 变更说明
 
+## 2026-05-21 将 RULER 统一汇总输出迁移为 CSV
+
+### 变更文件
+
+- `RULER/scripts/eval/collect_results.py`
+  - 将统一汇总输出从单个 xlsx 工作簿改为一组 csv 文件。
+  - 主输出文件保存 `detail` 明细表，其他表按同名前缀写出 `summary_by_model`、`summary_by_model_and_length`、`summary_by_task` 和 `run_info` csv。
+  - 新增 `.csv` 后缀校验，避免继续生成 `.xlsx` 汇总文件。
+
+- `RULER/scripts/run_parquet_parallel.py`
+  - 将自动汇总默认文件名改为 `ruler_results.csv`。
+  - 更新 `--auto-evaluate` 和 `--report-file` 的命令行说明，使 runner workflow 指向 csv 汇总。
+  - 在 runner 配置阶段拒绝非 `.csv` 的 `--report-file`，避免推理结束后才发现汇总路径格式错误。
+
+- `tests/test_collect_results.py`
+  - 将汇总输出测试从 xlsx zip/XML 检查改为 csv 文件内容检查。
+  - 覆盖 `.xlsx` 输出路径应被拒绝的行为。
+
+- `tests/test_run_parquet_parallel.py`
+  - 覆盖 runner 默认自动汇总文件名为 `ruler_results.csv`。
+  - 覆盖 runner 会提前拒绝 `.xlsx` 汇总路径。
+
+- `AGENTS.md`
+  - 将当前 RULER workflow、命令示例和输出说明更新为 csv 多文件汇总。
+  - 保留旧不完整 `.xlsx` 产物的历史事实，并明确当前新 workflow 应使用 csv。
+
+- `CODEX_CHANGES.md`
+  - 记录本次 csv 迁移。
+
+### 变更目的
+
+本次变更用于满足 RULER workflow 最终汇总文件不再使用 `.xlsx` 格式的要求。新的汇总输出只使用 Python 标准库 `csv`，适合脚本读取，也避免依赖 `openpyxl`、`xlsxwriter` 或自定义 xlsx XML 写出逻辑。
+
+### 主要函数和类
+
+- `csv_file_for_sheet`
+  - 根据主 csv 路径和表名生成对应的 sidecar csv 路径。
+- `validate_csv_output_file`
+  - 校验 `--output-file` 必须使用 `.csv` 后缀。
+- `write_csv`
+  - 将 `collect_results()` 返回的五张表写出为一组 csv 文件。
+- `build_config`
+  - 继续构造 runner 配置，但默认 `report_file` 现在指向 `ruler_results.csv`。
+
+### 运行方式
+
+手动生成统一 csv 汇总：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python eval/collect_results.py \
+  --output-root ../benchmark_root/local_eval \
+  --data-root ../benchmark_root/parquet_data/synthetic \
+  --benchmark synthetic \
+  --seq-lengths 4096 \
+  --tasks all \
+  --timing-file ../benchmark_root/local_eval/ruler_timing.jsonl \
+  --output-file ../benchmark_root/local_eval/ruler_results_4k_all_models.csv
+```
+
+自动预测后汇总时继续使用 runner 的 `--auto-evaluate`，默认会写出 `output-root/ruler_results.csv` 和同名前缀的 summary/run_info csv 文件。
+
+### 测试和验证
+
+本次需要运行的验证命令：
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests.test_collect_results tests.test_run_parquet_parallel
+conda run --no-capture-output -n model python -B -m unittest discover -s tests
+conda run --no-capture-output -n model python -B -m py_compile RULER/scripts/eval/collect_results.py RULER/scripts/run_parquet_parallel.py
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --auto-evaluate \
+  --dry-run
+git diff --check
+git -C RULER diff --check
+```
+
+### 假设和限制
+
+- 旧的 `.xlsx` 汇总产物不会自动删除或迁移，后续新汇总应显式输出到 `.csv`。
+- `--output-file` 和 `--report-file` 参数名保持不变，但参数值现在必须是 `.csv` 主输出路径。
+- 每次汇总会写出五个 csv 文件；读取 summary 时需要使用同名前缀的 sidecar 文件。
+
 ## 2026-05-20 新增 RULER 20 条固定随机子数据集划分脚本
 
 ### 变更文件

@@ -25,11 +25,11 @@
 - 当前 RULER 主环境：`/data/czy/miniconda3/envs/model/bin/python`，Python `3.10.20`。
 - `model` 环境当前可导入 `torch`、`transformers`、`pyarrow`、`pandas`、`nltk`、`yaml`、`nemo`、`accelerate`、`safetensors`、`sentencepiece` 和 `numpy`。
 - `model` 环境当前关键版本：`torch 2.4.1+cu121`、`torch.version.cuda 12.1`、`transformers 4.47.1`、`pyarrow 24.0.0`、`pandas 2.3.3`。
-- `model` 环境当前不能导入 `openpyxl`，但本地 `RULER/scripts/eval/collect_results.py` 自带 xlsx 写出逻辑，不依赖 `openpyxl`。
+- `model` 环境当前不能导入 `openpyxl`，但本地 `RULER/scripts/eval/collect_results.py` 使用标准库写出 csv，不依赖 `openpyxl`。
 - `nvidia-smi` 当前无法和 NVIDIA driver 通信，GPU 状态需要重新确认。
 - `model` 环境中 `torch.cuda.is_available()` 当前为 `False`，正式 GPU 推理前仍需修复 NVIDIA driver 或设备节点。
 - `RULER/benchmark_root/parquet_data/synthetic/` 当前已经存在，覆盖 9 个长度和 13 个任务，共 117 个 `validation.jsonl` 输入文件。
-- `RULER/benchmark_root/local_eval/` 当前已经存在，包含四个模型的 4k 输出目录、52 个任务日志、11 个预测 jsonl、`ruler_timing.jsonl` 和 `ruler_results_4k_all_models.xlsx`；这是一份不完整或曾失败的 4k 运行结果，复用前应检查日志和预测文件完整性。
+- `RULER/benchmark_root/local_eval/` 当前已经存在，包含四个模型的 4k 输出目录、52 个任务日志、11 个预测 jsonl、`ruler_timing.jsonl` 和旧的 `ruler_results_4k_all_models.xlsx`；这是一份不完整或曾失败的 4k 运行结果，复用前应检查日志和预测文件完整性。当前新 workflow 的统一汇总输出应使用 csv。
 - `benchmark/RULER-llama3-1M/` 当前存在 117 个任务长度目录，覆盖 9 个长度和 13 个 synthetic 任务；共有 118 个 `validation-*.parquet`，其中 `qa_1_1M` 有两个 parquet 分片。
 - `ruler_sample_counts_4k_64k.csv` 当前记录了 4k、8k、16k、32k、64k 各任务样本数；这五个长度下 13 个任务均为每任务每长度 500 条。
 - 根目录 `README.md` 已按用户要求删除，后续由用户重新整理。
@@ -132,7 +132,7 @@
 - `RULER/scripts/eval/collect_results.py`
   - 本地统一汇总脚本。
   - 跨模型、长度和任务读取预测 jsonl、生成阶段 PPL 字段和 runner timing jsonl。
-  - 输出单个 `ruler_results.xlsx`，包含 `detail`、`summary_by_model`、`summary_by_model_and_length`、`summary_by_task` 和 `run_info`。
+  - 输出一组 csv 文件：主文件 `ruler_results.csv` 为 `detail` 明细，其余表写到同名前缀的 `summary_by_model`、`summary_by_model_and_length`、`summary_by_task` 和 `run_info` csv 文件。
 - `RULER/benchmark_root/parquet_data/synthetic/`
   - `RULER/scripts/data/prepare_parquet.py` 生成的 RULER jsonl 输入数据。
   - 当前新服务器上该目录已经存在，包含 117 个 `validation.jsonl` 输入文件。
@@ -274,8 +274,8 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 - `--log-batch-progress`：让子进程输出 `[BATCH_START]`、`[BATCH_DONE]`、`[BATCH_FAILED]`，runner 会把这些行同步回显并写入日志。
 - `--log-generation-ppl`：让 Hugging Face 子进程在生成阶段写入 `generation_logprob_sum`、`generation_token_count`、`generation_nll` 和 `generation_ppl`。该 PPL 是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
 - `--timing-file`：结构化任务耗时 jsonl；默认写到 `RULER/benchmark_root/local_eval/ruler_timing.jsonl`。
-- `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 xlsx 汇总。
-- `--report-file`：统一汇总 xlsx 输出路径；默认写到 `RULER/benchmark_root/local_eval/ruler_results.xlsx`。
+- `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 csv 汇总。
+- `--report-file`：统一汇总 csv 主输出路径，必须使用 `.csv` 后缀；默认写到 `RULER/benchmark_root/local_eval/ruler_results.csv`。汇总脚本还会写出同名前缀的 summary 和 run_info csv 文件。
 - `--dry-run`：只打印命令，不启动推理。
 
 ### 4. 正式运行预测
@@ -314,7 +314,7 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --poll-interval 10 \
   --log-batch-progress \
   --auto-evaluate \
-  --report-file ../benchmark_root/local_eval/ruler_results_4k_all_models.xlsx \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_all_models.csv \
   --skip-existing
 ```
 
@@ -381,7 +381,7 @@ conda run --no-capture-output -n model python eval/evaluate.py \
 
 只要 `pred/` 目录里有对应任务的 `<任务>.jsonl`，`RULER/scripts/eval/evaluate.py` 就会评这些任务。缺失的任务会打印 `Prediction file <任务>.jsonl is not found.` 并跳过。
 
-生成跨模型、跨长度、跨任务的统一 xlsx 汇总：
+生成跨模型、跨长度、跨任务的统一 csv 汇总：
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
@@ -392,16 +392,15 @@ conda run --no-capture-output -n model python eval/collect_results.py \
   --seq-lengths 4096 \
   --tasks all \
   --timing-file ../benchmark_root/local_eval/ruler_timing.jsonl \
-  --output-file ../benchmark_root/local_eval/ruler_results_4k_all_models.xlsx
+  --output-file ../benchmark_root/local_eval/ruler_results_4k_all_models.csv
 ```
 
-`ruler_results.xlsx` 包含：
+`ruler_results_4k_all_models.csv` 是 `detail` 明细主表，汇总脚本还会生成同名前缀的四个 csv：
 
-- `detail`：每行唯一对应 `model + length + task`，记录 score、nulls、samples、pred_lines、生成阶段 PPL、任务耗时、GPU、预测文件和日志文件。
-- `summary_by_model`：每个模型一行，包含完成数量、平均分、平均 PPL、`total_task_elapsed_seconds`、`wall_time_seconds` 和样本总数。
-- `summary_by_model_and_length`：每个 `model + length` 一行，按长度观察分数、PPL 和耗时变化。
-- `summary_by_task`：每个任务一行，记录平均分、最高分对应模型和长度、平均 PPL 和平均耗时。
-- `run_info`：记录汇总时间、输入目录、模型/长度/任务列表和 score/PPL/time 口径。
+- `ruler_results_4k_all_models_summary_by_model.csv`：每个模型一行，包含完成数量、平均分、平均 PPL、`total_task_elapsed_seconds`、`wall_time_seconds` 和样本总数。
+- `ruler_results_4k_all_models_summary_by_model_and_length.csv`：每个 `model + length` 一行，按长度观察分数、PPL 和耗时变化。
+- `ruler_results_4k_all_models_summary_by_task.csv`：每个任务一行，记录平均分、最高分对应模型和长度、平均 PPL 和平均耗时。
+- `ruler_results_4k_all_models_run_info.csv`：记录汇总时间、输入目录、模型/长度/任务列表和 score/PPL/time 口径。
 
 ### 7. 检查已有数据和结果
 

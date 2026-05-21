@@ -1,0 +1,24 @@
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[features]
+goals = true
+multi_agent = true
+
+[projects."/data/czy/ICLR-2027"]
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+
+[plugins."superpowers@openai-curated"]
+enabled = true
+
+[notice]
+fast_default_opt_out = true
+
+[tui]
+alternate_screen = "never"
