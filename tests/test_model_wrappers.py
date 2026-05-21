@@ -74,6 +74,38 @@ class ModelWrappersTest(unittest.TestCase):
         self.assertAlmostEqual(stats["generation_nll"], expected_nll, places=6)
         self.assertAlmostEqual(stats["generation_ppl"], float(torch.exp(torch.tensor(expected_nll)).item()), places=6)
 
+    def test_generation_ppl_stats_can_include_token_details(self):
+        module = _load_module()
+
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                return {0: "<zero>", 1: "甲"}[int(token_ids[0])]
+
+        scores = (
+            torch.log(torch.tensor([[0.25, 0.75]], dtype=torch.float32)),
+            torch.log(torch.tensor([[0.8, 0.2]], dtype=torch.float32)),
+        )
+        generated_token_ids = torch.tensor([[1, 0]])
+
+        stats = module.compute_generation_ppl_stats(
+            scores,
+            generated_token_ids,
+            tokenizer=FakeTokenizer(),
+            include_token_details=True,
+        )
+
+        token_details = stats["generation_tokens"]
+        self.assertEqual(len(token_details), 2)
+        self.assertEqual(token_details[0]["position"], 0)
+        self.assertEqual(token_details[0]["token_id"], 1)
+        self.assertEqual(token_details[0]["token"], "甲")
+        self.assertAlmostEqual(token_details[0]["logprob"], float(torch.log(torch.tensor(0.75)).item()), places=6)
+        self.assertAlmostEqual(token_details[0]["nll"], -float(torch.log(torch.tensor(0.75)).item()), places=6)
+        self.assertAlmostEqual(token_details[0]["ppl"], float(torch.exp(-torch.log(torch.tensor(0.75))).item()), places=6)
+        self.assertEqual(token_details[1]["position"], 1)
+        self.assertEqual(token_details[1]["token_id"], 0)
+        self.assertEqual(token_details[1]["token"], "<zero>")
+
     def test_generation_ppl_stats_handle_empty_generation(self):
         module = _load_module()
 

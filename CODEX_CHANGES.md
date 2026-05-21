@@ -1,5 +1,134 @@
 # CODEX 变更说明
 
+## 2026-05-21 新增生成 token 级 PPL 明细记录
+
+### 变更文件
+
+- `RULER/scripts/pred/model_wrappers.py`
+  - 扩展 Hugging Face 生成阶段 PPL 统计逻辑。
+  - `compute_generation_ppl_stats()` 继续返回样本级 `generation_logprob_sum`、`generation_token_count`、`generation_nll` 和 `generation_ppl`，并可在 `include_token_details=True` 时额外返回每个生成 token 的 `position`、`token_id`、`token`、`logprob`、`nll` 和 `ppl`。
+  - `HuggingFaceModel` 新增 `log_generation_token_ppl` 开关；开启后自动启用样本级 PPL，并在 batch 和 attention 路径中返回 token 级明细。
+
+- `RULER/scripts/pred/call_api.py`
+  - 新增 `--log_generation_token_ppl` 参数，仅支持 `--server_type hf`。
+  - 新增 `build_generation_token_record()`，把模型返回的 token 级 PPL 明细写入 sidecar jsonl 记录。
+  - 开启该参数后，每个任务会额外写出 `<任务>.generation_tokens.jsonl`，主预测 jsonl 仍保持原有评分兼容结构。
+
+- `RULER/scripts/run_parquet_parallel.py`
+  - 新增 runner 参数 `--log-generation-token-ppl`，透传到 `pred/call_api.py`。
+  - 该 runner 参数会自动启用样本级 `--log-generation-ppl`。
+  - `--overwrite-existing` 现在会一并删除旧的 `<任务>.generation_tokens.jsonl`。
+
+- `tests/test_model_wrappers.py`
+  - 新增 token 级 PPL 明细测试，验证每个 token 的 logprob、NLL、PPL 和解码文本。
+
+- `tests/test_call_api_progress.py`
+  - 新增 `--log_generation_token_ppl` 参数存在性检查。
+  - 新增 sidecar 记录构造测试，验证 `index`、`task`、`generation_token_count` 和 `tokens` 字段。
+
+- `tests/test_run_parquet_parallel.py`
+  - 新增 runner 新参数透传测试。
+  - 覆盖 `--log-generation-token-ppl` 会自动启用样本级 PPL。
+  - 覆盖覆盖重跑时删除 token 级 PPL sidecar 文件。
+
+- `AGENTS.md`
+  - 补充 token 级 PPL 明细文件、参数、输出口径和覆盖重跑清理范围。
+
+- `CODEX_CHANGES.md`
+  - 记录本次 token 级 PPL 明细能力。
+
+### 变更目的
+
+本次变更用于让本地 RULER Hugging Face 预测流程在模型运行时保留每个生成 token 的困惑度明细。主预测 jsonl 继续只保存样本级聚合 PPL，避免影响 RULER 原生评分；token 级明细独立写到 sidecar 文件，方便后续按任务、样本和 token 分析模型生成行为。
+
+### 主要函数和类
+
+- `compute_generation_ppl_stats`
+  - 可选返回 token 级明细；每个 token 的 `nll=-logprob`，`ppl=exp(nll)`。
+- `compute_batch_generation_ppl_stats`
+  - 将 token 级明细开关应用到 batch 中每条样本。
+- `HuggingFaceModel`
+  - 新增 `log_generation_token_ppl` 配置，保证 token 明细和样本级 PPL 使用同一批 `generate(..., output_scores=True)` scores。
+- `build_generation_token_record`
+  - 构造 `<任务>.generation_tokens.jsonl` 的单行记录。
+- `overwrite_files_for`
+  - 覆盖重跑时把旧 token 级 PPL sidecar 纳入删除范围。
+
+### 运行方式
+
+单任务 dry-run 检查命令是否透传 token 级 PPL 参数：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --log-generation-token-ppl \
+  --dry-run
+```
+
+正式重跑并记录每个生成 token 的 PPL 时，应使用 `--overwrite-existing` 避免旧预测文件或旧 sidecar 混入：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --log-generation-token-ppl \
+  --overwrite-existing
+```
+
+输出文件示例：
+
+```text
+RULER/benchmark_root/local_eval/Llama-3.1-8B/synthetic/4096/pred/niah_single_1.generation_tokens.jsonl
+```
+
+### 测试和验证
+
+本次需要运行的验证命令：
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests/test_model_wrappers.py
+conda run --no-capture-output -n model python -B -m unittest tests/test_call_api_progress.py
+conda run --no-capture-output -n model python -B -m unittest tests/test_run_parquet_parallel.py
+conda run --no-capture-output -n model python -B -m unittest discover -s tests
+conda run --no-capture-output -n model python -B -m py_compile \
+  RULER/scripts/pred/model_wrappers.py \
+  RULER/scripts/pred/call_api.py \
+  RULER/scripts/run_parquet_parallel.py
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --log-generation-token-ppl \
+  --dry-run
+git diff --check
+git -C RULER diff --check
+```
+
+### 假设和限制
+
+- token 级 PPL 只支持 `--server_type hf`，因为它依赖 Hugging Face `generate(..., output_scores=True)` 返回的逐步 scores。
+- 记录的是模型对自己生成答案 token 的困惑度，不是参考答案困惑度，也不是 prompt 困惑度。
+- token 明细基于生成阶段 token ids 计算；如果后续 `stop_words` 裁剪了文本，sidecar 仍记录模型原始生成 token 的 PPL。
+- 开启 token 级明细会显著增加输出文件体积；全量四模型多长度运行前应确认磁盘空间。
+
 ## 2026-05-21 将 RULER 统一汇总输出迁移为 CSV
 
 ### 变更文件

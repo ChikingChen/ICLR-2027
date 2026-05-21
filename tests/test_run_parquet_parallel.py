@@ -108,7 +108,7 @@ class RunParquetParallelTest(unittest.TestCase):
                 "--log-attention-scores",
                 "--attention-top-k",
                 "6",
-                "--log-generation-ppl",
+                "--log-generation-token-ppl",
             ]
         )
         config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
@@ -121,8 +121,11 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertIn("--log_batch_progress", command)
         self.assertIn("--log_attention_scores", command)
         self.assertIn("--log_generation_ppl", command)
+        self.assertIn("--log_generation_token_ppl", command)
         self.assertIn("--attention_top_k", command)
         self.assertIn("6", command)
+        self.assertTrue(config.log_generation_ppl)
+        self.assertTrue(config.log_generation_token_ppl)
         self.assertEqual(module.prediction_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/pred/niah_single_1.jsonl"))
         self.assertEqual(module.log_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/logs/niah_single_1.log"))
         self.assertIn("/data/parquet/synthetic/4096/data", command)
@@ -226,8 +229,9 @@ class RunParquetParallelTest(unittest.TestCase):
             log_file = module.log_file_for(job, config)
             attention_jsonl = pred_file.with_suffix(".attention.jsonl")
             attention_markdown = pred_file.with_suffix(".attention.md")
+            generation_tokens = pred_file.with_suffix(".generation_tokens.jsonl")
             unrelated_file = pred_file.parent / "qa_2.jsonl"
-            for path in [pred_file, log_file, attention_jsonl, attention_markdown, unrelated_file]:
+            for path in [pred_file, log_file, attention_jsonl, attention_markdown, generation_tokens, unrelated_file]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("old\n", encoding="utf-8")
 
@@ -240,9 +244,10 @@ class RunParquetParallelTest(unittest.TestCase):
                     "niah_single_1.log",
                     "niah_single_1.attention.jsonl",
                     "niah_single_1.attention.md",
+                    "niah_single_1.generation_tokens.jsonl",
                 ]),
             )
-            for path in [pred_file, log_file, attention_jsonl, attention_markdown]:
+            for path in [pred_file, log_file, attention_jsonl, attention_markdown, generation_tokens]:
                 self.assertFalse(path.exists())
             self.assertTrue(unrelated_file.exists())
 

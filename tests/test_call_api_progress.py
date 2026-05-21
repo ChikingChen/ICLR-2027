@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -40,6 +41,7 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertIn("--log_attention_scores", source)
         self.assertIn("--attention_top_k", source)
         self.assertIn("--log_generation_ppl", source)
+        self.assertIn("--log_generation_token_ppl", source)
         self.assertIn("[BATCH_START]", source)
         self.assertIn("[BATCH_DONE]", source)
         self.assertIn("[BATCH_FAILED]", source)
@@ -165,6 +167,33 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertEqual(record["generation_token_count"], 3)
         self.assertEqual(record["generation_nll"], 0.4)
         self.assertEqual(record["generation_ppl"], 1.4918246976412703)
+
+    def test_generation_token_record_keeps_per_token_ppl_details(self):
+        module = _load_call_api_module()
+
+        record = module.build_generation_token_record(
+            pred={
+                "generation_tokens": [
+                    {
+                        "position": 0,
+                        "token_id": 198,
+                        "token": "\\n",
+                        "logprob": -0.2,
+                        "nll": 0.2,
+                        "ppl": 1.2214027581601699,
+                    }
+                ]
+            },
+            index=7,
+            task="vt",
+        )
+
+        self.assertEqual(record["index"], 7)
+        self.assertEqual(record["task"], "vt")
+        self.assertEqual(record["generation_token_count"], 1)
+        self.assertEqual(record["tokens"][0]["token_id"], 198)
+        self.assertEqual(record["tokens"][0]["ppl"], 1.2214027581601699)
+        json.dumps(record, ensure_ascii=False)
 
 
 if __name__ == "__main__":

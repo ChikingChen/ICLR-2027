@@ -121,11 +121,11 @@
 - `RULER/scripts/pred/call_api.py`
   - RULER 原生预测入口。
   - 读取 `--data_dir/<task>/<subset>.jsonl`，加载指定模型或服务客户端，写出带 `pred` 字段的预测 jsonl。
-  - 本地增加了 `--log_batch_progress`、`--max_retries` 和 `--log_generation_ppl`，用于观察 batch 进度、避免单个 batch 无限重试，并在 Hugging Face 生成阶段记录生成 token PPL。
+  - 本地增加了 `--log_batch_progress`、`--max_retries`、`--log_generation_ppl` 和 `--log_generation_token_ppl`，用于观察 batch 进度、避免单个 batch 无限重试，并在 Hugging Face 生成阶段记录样本级或 token 级 PPL。
 - `RULER/scripts/pred/model_wrappers.py`
   - Hugging Face、本地模型和 Mamba wrapper。
   - 本地包含 GLM 配置兼容逻辑。
-  - 本地 Hugging Face wrapper 支持基于 `generate(..., output_scores=True)` 的生成答案 token PPL 统计。
+  - 本地 Hugging Face wrapper 支持基于 `generate(..., output_scores=True)` 的生成答案 token PPL 统计，并可额外返回每个生成 token 的 logprob、NLL 和 PPL 明细。
 - `RULER/scripts/eval/evaluate.py`
   - RULER 原生评分入口。
   - 读取预测 jsonl，按 `RULER/scripts/eval/synthetic/constants.py` 中的 metric 计算每个任务分数。
@@ -166,6 +166,8 @@
 - `generation_token_count`：开启 `--log_generation_ppl` 后写入，表示参与 PPL 计算的生成 token 数。
 - `generation_nll`：开启 `--log_generation_ppl` 后写入，计算方式为 `-generation_logprob_sum / generation_token_count`。
 - `generation_ppl`：开启 `--log_generation_ppl` 后写入，计算方式为 `exp(generation_nll)`。
+
+如果开启 `--log_generation_token_ppl`，`RULER/scripts/pred/call_api.py` 会额外写出 sidecar 文件 `<任务>.generation_tokens.jsonl`。每行对应一个样本，包含 `index`、`task`、`generation_token_count` 和 `tokens`；`tokens` 中每个元素记录生成 token 的 `position`、`token_id`、`token`、`logprob`、`nll` 和 `ppl`。该 token 级 PPL 仍然是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
 
 评分时，`RULER/scripts/eval/evaluate.py` 会比较 `pred` 和 `outputs`，并统计空预测数量。
 
@@ -270,9 +272,10 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 - `--batch-size`：`RULER/scripts/pred/call_api.py` 每次送入模型的样本数。长上下文模型很容易 OOM，保守使用 `1`。
 - `--poll-interval`：runner 检查子进程状态和打印进度的间隔秒数，默认 `10`。
 - `--skip-existing`：如果目标预测文件已存在，则跳过该任务。
-- `--overwrite-existing`：启动任务前删除对应任务已有的预测 jsonl、attention 摘要文件和日志文件，强制重新生成。它不能和 `--skip-existing` 同时使用。
+- `--overwrite-existing`：启动任务前删除对应任务已有的预测 jsonl、attention 摘要文件、生成 token PPL 明细文件和日志文件，强制重新生成。它不能和 `--skip-existing` 同时使用。
 - `--log-batch-progress`：让子进程输出 `[BATCH_START]`、`[BATCH_DONE]`、`[BATCH_FAILED]`，runner 会把这些行同步回显并写入日志。
 - `--log-generation-ppl`：让 Hugging Face 子进程在生成阶段写入 `generation_logprob_sum`、`generation_token_count`、`generation_nll` 和 `generation_ppl`。该 PPL 是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
+- `--log-generation-token-ppl`：让 Hugging Face 子进程额外写出 `<任务>.generation_tokens.jsonl`，记录每个生成 token 的 `logprob`、`nll` 和 `ppl`；该参数会自动启用样本级 `--log-generation-ppl`。
 - `--timing-file`：结构化任务耗时 jsonl；默认写到 `RULER/benchmark_root/local_eval/ruler_timing.jsonl`。
 - `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 csv 汇总。
 - `--report-file`：统一汇总 csv 主输出路径，必须使用 `.csv` 后缀；默认写到 `RULER/benchmark_root/local_eval/ruler_results.csv`。汇总脚本还会写出同名前缀的 summary 和 run_info csv 文件。
@@ -320,6 +323,8 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
 
 如果要使用此前确认可运行的较大 batch，可以把 `--batch-size 1` 改成 `--batch-size 15`。如果要覆盖旧结果，应删除 `--skip-existing` 并改用 `--overwrite-existing`。
 
+如果要在预测时记录每个生成 token 的困惑度，应加上 `--log-generation-token-ppl`。该参数会同时保留主预测 jsonl 中的样本级 PPL 字段，并额外为每个任务写出 `<任务>.generation_tokens.jsonl`。
+
 如果某个模型需要独立 Python，使用 `--model-python`：
 
 ```bash
@@ -327,7 +332,7 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model-python GLM-4-9B-Chat-1M=/data/czy/miniconda3/envs/<glm-env>/bin/python
 ```
 
-如果需要重新跑已经生成过的任务，不要传 `--skip-existing`，改传 `--overwrite-existing`。该参数会在任务启动前删除对应 `<任务>.jsonl`、`<任务>.attention.jsonl`、`<任务>.attention.md` 和 `<任务>.log`，然后让 `pred/call_api.py` 从头生成。
+如果需要重新跑已经生成过的任务，不要传 `--skip-existing`，改传 `--overwrite-existing`。该参数会在任务启动前删除对应 `<任务>.jsonl`、`<任务>.attention.jsonl`、`<任务>.attention.md`、`<任务>.generation_tokens.jsonl` 和 `<任务>.log`，然后让 `pred/call_api.py` 从头生成。
 
 ### 5. 直接调用 call_api.py 的场景
 
@@ -367,6 +372,7 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u pred/cal
 - `--log_batch_progress`：输出 batch 开始、完成和失败日志。
 - `--max_retries`：单个 batch 失败后的最大重试次数，默认 `3`。超过后进程非零退出，runner 会释放该 GPU 并记录失败。
 - `--log_generation_ppl`：仅支持 `--server_type hf`。开启后在每条预测 jsonl 记录中追加生成答案 token 的 PPL 统计字段。
+- `--log_generation_token_ppl`：仅支持 `--server_type hf`。开启后额外写出 `<任务>.generation_tokens.jsonl`，记录每个生成 token 的 `logprob`、`nll` 和 `ppl`，并自动启用 `--log_generation_ppl`。
 
 ### 6. 运行评分和统一测评汇总
 
