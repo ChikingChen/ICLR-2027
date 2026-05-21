@@ -563,10 +563,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """命令行入口。"""
 
     args = build_parser().parse_args(argv)
+    output_file = args.output_file or (args.output_root / "ruler_results.csv")
+    validate_csv_output_file(output_file)
     models = parse_csv(args.models) or discover_models(args.output_root, args.benchmark)
     lengths = parse_lengths(args.seq_lengths, args.data_root)
     tasks = resolve_tasks(args.tasks, args.benchmark)
-    output_file = args.output_file or (args.output_root / "ruler_results.csv")
     workbook = collect_results(
         output_root=args.output_root,
         data_root=args.data_root,

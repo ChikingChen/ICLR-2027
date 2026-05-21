@@ -7,7 +7,7 @@
 - `RULER/scripts/eval/collect_results.py`
   - 将统一汇总输出从单个 xlsx 工作簿改为一组 csv 文件。
   - 主输出文件保存 `detail` 明细表，其他表按同名前缀写出 `summary_by_model`、`summary_by_model_and_length`、`summary_by_task` 和 `run_info` csv。
-  - 新增 `.csv` 后缀校验，避免继续生成 `.xlsx` 汇总文件。
+  - 新增 `.csv` 后缀校验，并在命令行入口访问数据目录前提前执行，避免继续生成 `.xlsx` 汇总文件。
 
 - `RULER/scripts/run_parquet_parallel.py`
   - 将自动汇总默认文件名改为 `ruler_results.csv`。
@@ -17,6 +17,7 @@
 - `tests/test_collect_results.py`
   - 将汇总输出测试从 xlsx zip/XML 检查改为 csv 文件内容检查。
   - 覆盖 `.xlsx` 输出路径应被拒绝的行为。
+  - 覆盖 `.xlsx` 输出路径会先于数据目录发现被拒绝。
 
 - `tests/test_run_parquet_parallel.py`
   - 覆盖 runner 默认自动汇总文件名为 `ruler_results.csv`。
