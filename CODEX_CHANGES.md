@@ -1,5 +1,135 @@
 # CODEX 变更说明
 
+## 2026-05-21 新增 RULER prefill/decode timing 和首样本 attention profiler
+
+### 变更文件
+
+- `RULER/scripts/pred/model_wrappers.py`
+  - 新增 Hugging Face 生成阶段 prefill/decode forward 耗时采集。
+  - 新增 attention kernel profiler 汇总逻辑，按 profiler event 名称过滤 `flash_attn`、`scaled_dot_product`、`fmha`、`sdpa`、`attention` 等相关 CUDA 事件。
+  - `HuggingFaceModel` 新增 `log_prefill_decode_timing` 和 `profile_attention_kernels` 开关；开启后强制使用直接模型路径，不走 pipeline。
+
+- `RULER/scripts/pred/call_api.py`
+  - 新增 `--log_prefill_decode_timing`、`--profile_attention_kernels` 和 `--attention_profile_sample_offset`。
+  - 固定 `--batch_size 1`，传入非 `1` 会直接报错。
+  - 新增 `<任务>.generation_timing.jsonl` sidecar：每条样本写 `sample_timing`，每个任务最多写一条固定第 0 行的 `attention_profile`。
+
+- `RULER/scripts/run_parquet_parallel.py`
+  - 新增 runner 参数 `--log-prefill-decode-timing`、`--profile-attention-kernels` 和 `--attention-profile-sample-offset`。
+  - 固定 `--batch-size 1`，传入非 `1` 会报错；构造子进程命令时始终传 `--batch_size 1`。
+  - `--overwrite-existing` 现在会删除 `<任务>.generation_timing.jsonl`。
+
+- `RULER/scripts/eval/collect_results.py`
+  - 新增读取 `<任务>.generation_timing.jsonl` 并汇总到 detail、summary_by_model、summary_by_model_and_length 和 summary_by_task csv。
+  - detail 新增 `sample_timing_records`、`prefill_forward_ms_total`、`decode_forward_ms_total`、`decode_forward_ms_per_token_avg`、`attention_profile_sample_line_no`、`attention_profile_sample_index`、`prefill_attention_kernel_ms`、`decode_attention_kernel_ms_total`、`decode_attention_kernel_ms_per_token_avg` 和 `attention_kernel_event_count` 等字段。
+
+- `tests/test_model_wrappers.py`
+  - 新增 generation timing 聚合和 attention profiler event 过滤测试。
+
+- `tests/test_call_api_progress.py`
+  - 新增 batch size 固定为 1、首条样本 profiler 选择、timing sidecar 记录构造测试。
+
+- `tests/test_run_parquet_parallel.py`
+  - 新增 runner 新参数透传、固定 batch size 校验和覆盖删除 timing sidecar 测试。
+
+- `tests/test_collect_results.py`
+  - 新增 generation timing sidecar 汇总测试。
+
+- `AGENTS.md`
+  - 同步新增参数、输出文件、固定 batch size 行为、summary 字段和限制说明。
+
+- `CODEX_CHANGES.md`
+  - 记录本次 prefill/decode timing 和 attention profiler 变更。
+
+### 变更目的
+
+本次变更用于让本地 RULER Hugging Face 推理在保留原有分数、PPL 和任务级耗时的基础上，进一步记录推理阶段内部耗时：普通 prefill/decode forward 耗时覆盖每条样本；严格 attention kernel profiler 固定每个 `model + length + task` 只采输入 jsonl 第 0 行，避免全量 profiler 带来过大开销。
+
+### 主要函数和类
+
+- `summarize_generation_timing`
+  - 聚合 prefill/decode forward 耗时，并按生成 token 数计算 `decode_forward_ms_per_token_avg`。
+- `summarize_attention_kernel_events`
+  - 从 `torch.profiler` events 中过滤 attention 相关设备事件并汇总耗时。
+- `ForwardTimingCollector`
+  - 在 `generate()` 期间临时包裹 `model.forward`，按 prefill/decode 阶段记录耗时。
+- `HuggingFaceModel.profile_attention_kernels_for_prompt`
+  - 对单条 prompt 执行严格 profiler，分别返回 prefill attention kernel 时间和 decode attention kernel 时间。
+- `validate_runtime_args`
+  - 统一校验 `call_api.py` 参数，保证 batch size 和 profiler 采样口径固定。
+- `build_generation_timing_record`、`build_attention_profile_record`
+  - 构造 `<任务>.generation_timing.jsonl` 中的 `sample_timing` 和 `attention_profile` 记录。
+- `aggregate_generation_timing`
+  - 汇总 timing sidecar 到最终 csv 明细和汇总表。
+
+### 运行方式
+
+记录每个生成 token 的 PPL、每条样本 prefill/decode forward 耗时，并对每个任务第 0 行采样严格 attention kernel 时间：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --log-generation-token-ppl \
+  --log-prefill-decode-timing \
+  --profile-attention-kernels \
+  --overwrite-existing \
+  --auto-evaluate
+```
+
+输出文件示例：
+
+```text
+RULER/benchmark_root/local_eval/Llama-3.1-8B/synthetic/4096/pred/niah_single_1.generation_timing.jsonl
+RULER/benchmark_root/local_eval/ruler_results.csv
+RULER/benchmark_root/local_eval/ruler_results_summary_by_model.csv
+```
+
+### 测试和验证
+
+本次已经运行：
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests.test_model_wrappers tests.test_call_api_progress tests.test_run_parquet_parallel tests.test_collect_results
+conda run --no-capture-output -n model python -B -m unittest discover -s tests
+conda run --no-capture-output -n model python -B -m py_compile \
+  RULER/scripts/data/prepare_parquet.py \
+  RULER/scripts/run_parquet_parallel.py \
+  RULER/scripts/pred/call_api.py \
+  RULER/scripts/pred/model_wrappers.py \
+  RULER/scripts/eval/collect_results.py \
+  tools/count_ruler_samples.py
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks niah_single_1 \
+  --gpus 0 \
+  --server-type hf \
+  --batch-size 1 \
+  --log-batch-progress \
+  --log-generation-token-ppl \
+  --log-prefill-decode-timing \
+  --profile-attention-kernels \
+  --dry-run
+git diff --check
+git -C RULER diff --check
+```
+
+### 假设和限制
+
+- 当前评测口径固定 `batch_size=1`；runner 和 `call_api.py` 都会拒绝非 `1` 的 batch size。
+- 严格 attention profiler 固定只采输入 jsonl 第 0 行；`sample_line_no=0` 是行号，`sample_index` 是样本原始 `index` 字段。
+- `prefill_forward_ms` 和 `decode_forward_ms_total` 是完整 forward 阶段耗时，不是纯 attention 时间。
+- `prefill_attention_kernel_ms` 和 `decode_attention_kernel_ms_total` 是 profiler 按 kernel 名称过滤后的严格 attention 设备时间；如果 CUDA 不可用或 profiler 没有匹配事件，会写入 warning 或空值。
+- `--profile-attention-kernels` 不能和会强制 eager attention 的 `--log-attention-scores` 同时使用。
+
 ## 2026-05-21 新增生成 token 级 PPL 明细记录
 
 ### 变更文件

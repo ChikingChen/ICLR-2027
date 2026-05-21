@@ -95,21 +95,39 @@ parser.add_argument("--log_attention_scores", action="store_true", help="输出 
 parser.add_argument("--attention_top_k", type=int, default=8, help="每层注意力摘要保留分数最高的 token 数量。")
 parser.add_argument("--log_generation_ppl", action="store_true", help="输出 Hugging Face 生成答案 token 的 PPL。")
 parser.add_argument("--log_generation_token_ppl", action="store_true", help="额外输出 Hugging Face 每个生成 token 的 PPL 明细。")
+parser.add_argument("--log_prefill_decode_timing", action="store_true", help="输出 Hugging Face prefill/decode forward 阶段耗时。")
+parser.add_argument("--profile_attention_kernels", action="store_true", help="对每个任务第 0 行样本额外统计严格 attention CUDA kernel 时间。")
+parser.add_argument("--attention_profile_sample_offset", type=int, default=0, help="固定为 0，只 profile 输入 jsonl 第 0 行样本。")
 
-args = parser.parse_args()
-if args.max_retries <= 0:
-    raise ValueError("--max_retries 必须是正整数")
-if args.attention_top_k <= 0:
-    raise ValueError("--attention_top_k 必须是正整数")
-if args.log_attention_scores and args.server_type != "hf":
-    raise ValueError("--log_attention_scores 目前只支持 --server_type hf")
-if (args.log_generation_ppl or args.log_generation_token_ppl) and args.server_type != "hf":
-    raise ValueError("--log_generation_ppl 和 --log_generation_token_ppl 目前只支持 --server_type hf")
-if args.log_generation_token_ppl:
-    args.log_generation_ppl = True
-args.stop_words = list(filter(None, args.stop_words.split(',')))
-if args.server_type == 'hf' or args.server_type == 'gemini':
-    args.threads = 1
+
+def validate_runtime_args(parsed_args):
+    """集中校验运行参数，保证本地评测口径稳定。"""
+
+    if parsed_args.batch_size != 1:
+        raise ValueError("--batch_size 当前固定为 1，请不要传入其他值。")
+    if parsed_args.max_retries <= 0:
+        raise ValueError("--max_retries 必须是正整数")
+    if parsed_args.attention_top_k <= 0:
+        raise ValueError("--attention_top_k 必须是正整数")
+    if parsed_args.log_attention_scores and parsed_args.server_type != "hf":
+        raise ValueError("--log_attention_scores 目前只支持 --server_type hf")
+    if (parsed_args.log_generation_ppl or parsed_args.log_generation_token_ppl) and parsed_args.server_type != "hf":
+        raise ValueError("--log_generation_ppl 和 --log_generation_token_ppl 目前只支持 --server_type hf")
+    if (parsed_args.log_prefill_decode_timing or parsed_args.profile_attention_kernels) and parsed_args.server_type != "hf":
+        raise ValueError("--log_prefill_decode_timing 和 --profile_attention_kernels 目前只支持 --server_type hf")
+    if parsed_args.profile_attention_kernels and parsed_args.log_attention_scores:
+        raise ValueError("--profile_attention_kernels 需要保持 flash attention 路径，不能和 --log_attention_scores 同时使用。")
+    if parsed_args.attention_profile_sample_offset != 0:
+        raise ValueError("--attention_profile_sample_offset 当前固定为 0，也就是只采输入 jsonl 第 0 行。")
+    if parsed_args.log_generation_token_ppl:
+        parsed_args.log_generation_ppl = True
+    parsed_args.stop_words = list(filter(None, parsed_args.stop_words.split(',')))
+    if parsed_args.server_type == 'hf' or parsed_args.server_type == 'gemini':
+        parsed_args.threads = 1
+    return parsed_args
+
+
+args = validate_runtime_args(parser.parse_args())
 
 
 def get_llm(tokens_to_generate):
@@ -198,6 +216,8 @@ def get_llm(tokens_to_generate):
             attention_top_k=args.attention_top_k,
             log_generation_ppl=args.log_generation_ppl,
             log_generation_token_ppl=args.log_generation_token_ppl,
+            log_prefill_decode_timing=args.log_prefill_decode_timing,
+            profile_attention_kernels=args.profile_attention_kernels,
         )
     
     elif args.server_type == 'mamba':
@@ -362,6 +382,69 @@ def build_generation_token_record(pred, index, task):
     }
 
 
+def build_generation_timing_record(pred, index, task, sample_line_no):
+    """把模型返回的 prefill/decode timing 转换成 sidecar jsonl 记录。"""
+
+    timing = {}
+    if isinstance(pred, dict):
+        timing = pred.get("generation_timing") or {}
+    record = {
+        "record_type": "sample_timing",
+        "task": task,
+        "sample_line_no": sample_line_no,
+        "sample_index": index,
+    }
+    record.update(timing)
+    return record
+
+
+def select_attention_profile_sample(data, sample_offset=0):
+    """选择严格 profiler 样本；当前固定只允许输入 jsonl 第 0 行。"""
+
+    if sample_offset != 0:
+        raise ValueError("attention profiler 当前固定只采输入 jsonl 第 0 行。")
+    if not data:
+        return None
+    return {
+        "sample_line_no": 0,
+        "sample": data[0],
+    }
+
+
+def build_attention_profile_record(profile, task, sample, sample_line_no, input_file):
+    """把第 0 行样本的严格 attention profiler 结果转换成 sidecar jsonl 记录。"""
+
+    record = {
+        "record_type": "attention_profile",
+        "task": task,
+        "profile_sample_policy": "first_input_record",
+        "sample_line_no": sample_line_no,
+        "sample_index": sample.get("index"),
+        "input_file": str(input_file),
+    }
+    record.update(profile)
+    return record
+
+
+def timing_sidecar_has_attention_profile(path):
+    """判断 timing sidecar 是否已经存在 attention_profile 记录，避免续跑重复追加。"""
+
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8") as file_obj:
+        for line in file_obj:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                record = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if record.get("record_type") == "attention_profile":
+                return True
+    return False
+
+
 def main():
     start_time = time.time()
     
@@ -394,11 +477,16 @@ def main():
     pred_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Load data
+    all_data = []
+    for sample_line_no, sample in enumerate(read_manifest(task_file)):
+        sample = dict(sample)
+        sample["sample_line_no"] = sample_line_no
+        all_data.append(sample)
     if os.path.exists(pred_file):
         pred_index = [sample['index'] for sample in read_manifest(pred_file)]
-        data = [sample for sample in read_manifest(task_file) if sample['index'] not in pred_index]
+        data = [sample for sample in all_data if sample['index'] not in pred_index]
     else:
-        data = read_manifest(task_file)
+        data = list(all_data)
 
     # Load api
     llm = get_llm(config['tokens_to_generate'])
@@ -411,6 +499,7 @@ def main():
         others_list,
         truncation_list,
         length_list,
+        sample_line_no_list,
         batch_meta,
     ):
         nonlocal llm
@@ -429,9 +518,9 @@ def main():
             return
 
         zipped_iter = zip(pred_list, idx_list, index_list, input_list,
-                          outputs_list, others_list, truncation_list, length_list)
+                          outputs_list, others_list, truncation_list, length_list, sample_line_no_list)
 
-        for pred, idx, index, input, outputs, others, truncation, length in zipped_iter:
+        for pred, idx, index, input, outputs, others, truncation, length, sample_line_no in zipped_iter:
             outputs_parallel[idx] = build_prediction_record(
                 pred=pred,
                 index=index,
@@ -453,6 +542,13 @@ def main():
                     index=index,
                     task=args.task,
                 )
+            if isinstance(pred, dict) and pred.get("generation_timing") is not None:
+                generation_timing_parallel[idx] = build_generation_timing_record(
+                    pred=pred,
+                    index=index,
+                    task=args.task,
+                    sample_line_no=sample_line_no,
+                )
 
         if args.log_batch_progress:
             elapsed = time.time() - batch_meta['started_at']
@@ -471,6 +567,7 @@ def main():
     outputs_parallel = [{} for _ in range(len(data))]
     attention_parallel = [{} for _ in range(len(data))]
     generation_token_parallel = [{} for _ in range(len(data))]
+    generation_timing_parallel = [{} for _ in range(len(data))]
 
     batched_data = []
     batch = []
@@ -489,6 +586,7 @@ def main():
     attention_jsonl_file = pred_file.with_suffix(".attention.jsonl")
     attention_markdown_file = pred_file.with_suffix(".attention.md")
     generation_token_jsonl_file = pred_file.with_suffix(".generation_tokens.jsonl")
+    generation_timing_jsonl_file = pred_file.with_suffix(".generation_timing.jsonl")
     write_attention_header = (
         args.log_attention_scores
         and (not attention_markdown_file.exists() or attention_markdown_file.stat().st_size == 0)
@@ -500,6 +598,7 @@ def main():
         attention_jsonl = None
         attention_markdown = None
         generation_token_jsonl = None
+        generation_timing_jsonl = None
         if args.log_attention_scores:
             attention_jsonl = stack.enter_context(open(attention_jsonl_file, 'at', encoding="utf-8", buffering=1))
             attention_markdown = stack.enter_context(open(attention_markdown_file, 'at', encoding="utf-8", buffering=1))
@@ -509,6 +608,43 @@ def main():
         if args.log_generation_token_ppl:
             generation_token_jsonl = stack.enter_context(open(generation_token_jsonl_file, 'at', encoding="utf-8", buffering=1))
             print(f"生成 token PPL 明细写入 {generation_token_jsonl_file}", flush=True)
+        if args.log_prefill_decode_timing or args.profile_attention_kernels:
+            generation_timing_jsonl = stack.enter_context(open(generation_timing_jsonl_file, 'at', encoding="utf-8", buffering=1))
+            print(f"生成阶段 timing 明细写入 {generation_timing_jsonl_file}", flush=True)
+
+        if args.profile_attention_kernels and not timing_sidecar_has_attention_profile(generation_timing_jsonl_file):
+            profile_sample = select_attention_profile_sample(
+                all_data,
+                sample_offset=args.attention_profile_sample_offset,
+            )
+            if profile_sample is not None:
+                sample = profile_sample["sample"]
+                try:
+                    profile = llm.profile_attention_kernels_for_prompt(sample["input"])
+                except Exception as error:
+                    profile = {
+                        "timer_backend": "torch_profiler",
+                        "input_tokens": None,
+                        "generated_token_count": None,
+                        "prefill_attention_kernel_ms": None,
+                        "decode_attention_kernel_ms_total": None,
+                        "decode_attention_kernel_ms_per_token_avg": None,
+                        "attention_kernel_event_count": 0,
+                        "warning": f"{type(error).__name__}: {error}",
+                    }
+                generation_timing_jsonl.write(
+                    json.dumps(
+                        build_attention_profile_record(
+                            profile=profile,
+                            task=args.task,
+                            sample=sample,
+                            sample_line_no=profile_sample["sample_line_no"],
+                            input_file=task_file,
+                        ),
+                        ensure_ascii=False,
+                    )
+                    + '\n'
+                )
 
         # the data is processed sequentially, so we can store the start and end of current processing window
         start_idx = 0  # window: [start_idx, end_idx]
@@ -544,6 +680,7 @@ def main():
                     others_list=[data_point.get('others', {}) for data_point in batch],
                     truncation_list=[data_point.get('truncation', -1) for data_point in batch],
                     length_list=[data_point.get('length', -1) for data_point in batch],
+                    sample_line_no_list=[data_point.get('sample_line_no') for data_point in batch],
                     batch_meta=batch_meta,
                 ),
             )
@@ -575,6 +712,8 @@ def main():
                         )
                     if generation_token_jsonl is not None and len(generation_token_parallel[idx]) > 0:
                         generation_token_jsonl.write(json.dumps(generation_token_parallel[idx], ensure_ascii=False) + '\n')
+                    if generation_timing_jsonl is not None and len(generation_timing_parallel[idx]) > 0:
+                        generation_timing_jsonl.write(json.dumps(generation_timing_parallel[idx], ensure_ascii=False) + '\n')
 
                 start_idx = end_idx + 1
 

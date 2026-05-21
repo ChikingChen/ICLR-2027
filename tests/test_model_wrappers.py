@@ -116,6 +116,49 @@ class ModelWrappersTest(unittest.TestCase):
         self.assertIsNone(stats["generation_nll"])
         self.assertIsNone(stats["generation_ppl"])
 
+    def test_generation_timing_summary_averages_decode_by_generated_tokens(self):
+        module = _load_module()
+
+        summary = module.summarize_generation_timing(
+            prefill_forward_ms=[10.0],
+            decode_forward_ms=[2.0, 4.0],
+            generated_token_count=3,
+            timer_backend="cuda_event",
+        )
+
+        self.assertEqual(summary["timer_backend"], "cuda_event")
+        self.assertEqual(summary["prefill_forward_ms"], 10.0)
+        self.assertEqual(summary["decode_forward_ms_total"], 6.0)
+        self.assertEqual(summary["decode_steps"], 2)
+        self.assertEqual(summary["generated_token_count"], 3)
+        self.assertAlmostEqual(summary["decode_forward_ms_per_token_avg"], 2.0)
+
+    def test_attention_kernel_summary_filters_attention_events(self):
+        module = _load_module()
+
+        events = [
+            SimpleNamespace(name="flash_attn_fwd", device_time_total=3000.0, cuda_time_total=0.0),
+            SimpleNamespace(name="aten::add", device_time_total=7000.0, cuda_time_total=0.0),
+            SimpleNamespace(name="scaled_dot_product_attention", device_time_total=2000.0, cuda_time_total=0.0),
+        ]
+
+        summary = module.summarize_attention_kernel_events(events)
+
+        self.assertEqual(summary["attention_kernel_event_count"], 2)
+        self.assertAlmostEqual(summary["attention_kernel_ms"], 5.0)
+        self.assertNotIn("warning", summary)
+
+    def test_attention_kernel_summary_warns_when_no_attention_event_matches(self):
+        module = _load_module()
+
+        summary = module.summarize_attention_kernel_events(
+            [SimpleNamespace(name="aten::add", device_time_total=3000.0, cuda_time_total=0.0)]
+        )
+
+        self.assertEqual(summary["attention_kernel_event_count"], 0)
+        self.assertIsNone(summary["attention_kernel_ms"])
+        self.assertIn("warning", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,12 +103,11 @@ class RunParquetParallelTest(unittest.TestCase):
                 "--python",
                 "/usr/bin/python",
                 "--batch-size",
-                "1000",
+                "1",
                 "--log-batch-progress",
-                "--log-attention-scores",
-                "--attention-top-k",
-                "6",
                 "--log-generation-token-ppl",
+                "--log-prefill-decode-timing",
+                "--profile-attention-kernels",
             ]
         )
         config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
@@ -119,17 +118,41 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertEqual(command[0], "/usr/bin/python")
         self.assertIn("pred/call_api.py", command)
         self.assertIn("--log_batch_progress", command)
-        self.assertIn("--log_attention_scores", command)
         self.assertIn("--log_generation_ppl", command)
         self.assertIn("--log_generation_token_ppl", command)
-        self.assertIn("--attention_top_k", command)
-        self.assertIn("6", command)
+        self.assertIn("--log_prefill_decode_timing", command)
+        self.assertIn("--profile_attention_kernels", command)
+        self.assertIn("--attention_profile_sample_offset", command)
+        self.assertIn("--batch_size", command)
+        self.assertEqual(command[command.index("--batch_size") + 1], "1")
         self.assertTrue(config.log_generation_ppl)
         self.assertTrue(config.log_generation_token_ppl)
+        self.assertTrue(config.log_prefill_decode_timing)
+        self.assertTrue(config.profile_attention_kernels)
         self.assertEqual(module.prediction_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/pred/niah_single_1.jsonl"))
         self.assertEqual(module.log_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/logs/niah_single_1.log"))
         self.assertIn("/data/parquet/synthetic/4096/data", command)
         self.assertIn("/data/local_eval/llama/synthetic/4096/pred", command)
+
+    def test_build_config_rejects_non_singleton_batch_size(self):
+        module = _load_module()
+        args = module.build_parser().parse_args(
+            [
+                "--model",
+                "llama=/models/llama",
+                "--seq-lengths",
+                "4096",
+                "--tasks",
+                "niah_single_1",
+                "--gpus",
+                "0",
+                "--batch-size",
+                "2",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "batch-size.*1"):
+            module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
 
     def test_model_python_overrides_command_python_for_matching_model(self):
         module = _load_module()
@@ -230,8 +253,9 @@ class RunParquetParallelTest(unittest.TestCase):
             attention_jsonl = pred_file.with_suffix(".attention.jsonl")
             attention_markdown = pred_file.with_suffix(".attention.md")
             generation_tokens = pred_file.with_suffix(".generation_tokens.jsonl")
+            generation_timing = pred_file.with_suffix(".generation_timing.jsonl")
             unrelated_file = pred_file.parent / "qa_2.jsonl"
-            for path in [pred_file, log_file, attention_jsonl, attention_markdown, generation_tokens, unrelated_file]:
+            for path in [pred_file, log_file, attention_jsonl, attention_markdown, generation_tokens, generation_timing, unrelated_file]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("old\n", encoding="utf-8")
 
@@ -245,9 +269,10 @@ class RunParquetParallelTest(unittest.TestCase):
                     "niah_single_1.attention.jsonl",
                     "niah_single_1.attention.md",
                     "niah_single_1.generation_tokens.jsonl",
+                    "niah_single_1.generation_timing.jsonl",
                 ]),
             )
-            for path in [pred_file, log_file, attention_jsonl, attention_markdown, generation_tokens]:
+            for path in [pred_file, log_file, attention_jsonl, attention_markdown, generation_tokens, generation_timing]:
                 self.assertFalse(path.exists())
             self.assertTrue(unrelated_file.exists())
 

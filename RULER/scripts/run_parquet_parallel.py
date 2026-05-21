@@ -81,6 +81,9 @@ class RunnerConfig(NamedTuple):
     attention_top_k: int
     log_generation_ppl: bool
     log_generation_token_ppl: bool
+    log_prefill_decode_timing: bool
+    profile_attention_kernels: bool
+    attention_profile_sample_offset: int
     overwrite_existing: bool
     timing_file: Path
     auto_evaluate: bool
@@ -247,6 +250,7 @@ def overwrite_files_for(job: Job, config: RunnerConfig) -> List[Path]:
         pred_file.with_suffix(".attention.jsonl"),
         pred_file.with_suffix(".attention.md"),
         pred_file.with_suffix(".generation_tokens.jsonl"),
+        pred_file.with_suffix(".generation_timing.jsonl"),
         log_file_for(job, config),
     ]
 
@@ -307,7 +311,7 @@ def build_call_api_command(job: Job, config: RunnerConfig) -> List[str]:
         "--random_seed",
         str(config.random_seed),
         "--batch_size",
-        str(config.batch_size),
+        "1",
     ]
     if config.stop_words:
         command.extend(["--stop_words", config.stop_words])
@@ -320,6 +324,11 @@ def build_call_api_command(job: Job, config: RunnerConfig) -> List[str]:
         command.append("--log_generation_ppl")
     if config.log_generation_token_ppl:
         command.append("--log_generation_token_ppl")
+    if config.log_prefill_decode_timing:
+        command.append("--log_prefill_decode_timing")
+    if config.profile_attention_kernels:
+        command.append("--profile_attention_kernels")
+        command.extend(["--attention_profile_sample_offset", str(config.attention_profile_sample_offset)])
     return command
 
 
@@ -426,6 +435,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="让 Hugging Face 子进程额外写出每个生成 token 的 PPL 明细。",
     )
     parser.add_argument(
+        "--log-prefill-decode-timing",
+        action="store_true",
+        help="让 Hugging Face 子进程写出每条样本的 prefill/decode forward 耗时。",
+    )
+    parser.add_argument(
+        "--profile-attention-kernels",
+        action="store_true",
+        help="让 Hugging Face 子进程额外对每个任务第 0 行样本统计严格 attention CUDA kernel 时间。",
+    )
+    parser.add_argument(
+        "--attention-profile-sample-offset",
+        type=int,
+        default=0,
+        help="固定为 0，只 profile 输入 jsonl 第 0 行样本。",
+    )
+    parser.add_argument(
         "--timing-file",
         type=Path,
         help="结构化任务耗时 jsonl；默认写到 output-root/ruler_timing.jsonl。",
@@ -456,12 +481,16 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
     model_python = parse_model_python_specs(args.model_python, models)
     if args.skip_existing and args.overwrite_existing:
         raise ValueError("--skip-existing 和 --overwrite-existing 不能同时使用")
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size 必须是正整数")
+    if args.batch_size != 1:
+        raise ValueError("--batch-size 当前固定为 1，请不要传入其他值")
     if args.poll_interval <= 0:
         raise ValueError("--poll-interval 必须是正数")
     if args.attention_top_k <= 0:
         raise ValueError("--attention-top-k 必须是正整数")
+    if args.profile_attention_kernels and args.log_attention_scores:
+        raise ValueError("--profile-attention-kernels 不能和 --log-attention-scores 同时使用")
+    if args.attention_profile_sample_offset != 0:
+        raise ValueError("--attention-profile-sample-offset 当前固定为 0")
     timing_file = args.timing_file if args.timing_file is not None else args.output_root / DEFAULT_TIMING_NAME
     report_file = args.report_file if args.report_file is not None else args.output_root / DEFAULT_REPORT_NAME
     if report_file.suffix.lower() != ".csv":
@@ -488,6 +517,9 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         attention_top_k=args.attention_top_k,
         log_generation_ppl=args.log_generation_ppl or args.log_generation_token_ppl,
         log_generation_token_ppl=args.log_generation_token_ppl,
+        log_prefill_decode_timing=args.log_prefill_decode_timing,
+        profile_attention_kernels=args.profile_attention_kernels,
+        attention_profile_sample_offset=args.attention_profile_sample_offset,
         overwrite_existing=args.overwrite_existing,
         timing_file=timing_file,
         auto_evaluate=args.auto_evaluate,

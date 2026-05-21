@@ -67,6 +67,51 @@ class CollectResultsTest(unittest.TestCase):
                 },
             ],
         )
+        _write_jsonl(
+            output_root / "model-a" / "synthetic" / "4096" / "pred" / "niah_single_1.generation_timing.jsonl",
+            [
+                {
+                    "record_type": "sample_timing",
+                    "task": "niah_single_1",
+                    "sample_line_no": 0,
+                    "sample_index": 0,
+                    "timer_backend": "cuda_event",
+                    "input_tokens": 128,
+                    "generated_token_count": 2,
+                    "prefill_forward_ms": 10.0,
+                    "decode_forward_ms_total": 4.0,
+                    "decode_forward_ms_per_token_avg": 2.0,
+                    "decode_steps": 1,
+                },
+                {
+                    "record_type": "sample_timing",
+                    "task": "niah_single_1",
+                    "sample_line_no": 1,
+                    "sample_index": 1,
+                    "timer_backend": "cuda_event",
+                    "input_tokens": 130,
+                    "generated_token_count": 3,
+                    "prefill_forward_ms": 20.0,
+                    "decode_forward_ms_total": 6.0,
+                    "decode_forward_ms_per_token_avg": 2.0,
+                    "decode_steps": 2,
+                },
+                {
+                    "record_type": "attention_profile",
+                    "task": "niah_single_1",
+                    "profile_sample_policy": "first_input_record",
+                    "sample_line_no": 0,
+                    "sample_index": 0,
+                    "timer_backend": "torch_profiler",
+                    "input_tokens": 128,
+                    "generated_token_count": 2,
+                    "prefill_attention_kernel_ms": 3.0,
+                    "decode_attention_kernel_ms_total": 1.5,
+                    "decode_attention_kernel_ms_per_token_avg": 0.75,
+                    "attention_kernel_event_count": 6,
+                },
+            ],
+        )
         timing_file = root / "timing.jsonl"
         _write_jsonl(
             timing_file,
@@ -258,6 +303,41 @@ class CollectResultsTest(unittest.TestCase):
             summary_row = workbook["summary_by_model"][0]
             self.assertAlmostEqual(summary_row["avg_generation_nll"], 0.5)
             self.assertAlmostEqual(summary_row["avg_generation_ppl"], math.exp(0.5))
+
+    def test_generation_timing_sidecar_is_aggregated(self):
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_root, data_root, timing_file = self._make_fixture(Path(tmp_dir))
+
+            workbook = module.collect_results(
+                output_root=output_root,
+                data_root=data_root,
+                benchmark="synthetic",
+                models=["model-a"],
+                lengths=[4096],
+                tasks=["niah_single_1"],
+                timing_file=timing_file,
+            )
+
+            detail_row = workbook["detail"][0]
+            self.assertEqual(detail_row["sample_timing_records"], 2)
+            self.assertEqual(detail_row["attention_profile_sample_line_no"], 0)
+            self.assertEqual(detail_row["attention_profile_sample_index"], 0)
+            self.assertAlmostEqual(detail_row["prefill_forward_ms_total"], 30.0)
+            self.assertAlmostEqual(detail_row["decode_forward_ms_total"], 10.0)
+            self.assertAlmostEqual(detail_row["decode_forward_ms_per_token_avg"], 2.0)
+            self.assertAlmostEqual(detail_row["prefill_attention_kernel_ms"], 3.0)
+            self.assertAlmostEqual(detail_row["decode_attention_kernel_ms_total"], 1.5)
+            self.assertAlmostEqual(detail_row["decode_attention_kernel_ms_per_token_avg"], 0.75)
+            self.assertEqual(detail_row["attention_kernel_event_count"], 6)
+
+            summary_row = workbook["summary_by_model"][0]
+            self.assertAlmostEqual(summary_row["total_prefill_forward_ms"], 30.0)
+            self.assertAlmostEqual(summary_row["total_decode_forward_ms"], 10.0)
+            self.assertAlmostEqual(summary_row["avg_decode_forward_ms_per_token"], 2.0)
+            self.assertEqual(summary_row["attention_profiled_tasks"], 1)
+            self.assertAlmostEqual(summary_row["avg_prefill_attention_kernel_ms"], 3.0)
+            self.assertAlmostEqual(summary_row["avg_decode_attention_kernel_ms_per_token"], 0.75)
 
 
 if __name__ == "__main__":

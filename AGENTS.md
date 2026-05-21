@@ -121,17 +121,18 @@
 - `RULER/scripts/pred/call_api.py`
   - RULER 原生预测入口。
   - 读取 `--data_dir/<task>/<subset>.jsonl`，加载指定模型或服务客户端，写出带 `pred` 字段的预测 jsonl。
-  - 本地增加了 `--log_batch_progress`、`--max_retries`、`--log_generation_ppl` 和 `--log_generation_token_ppl`，用于观察 batch 进度、避免单个 batch 无限重试，并在 Hugging Face 生成阶段记录样本级或 token 级 PPL。
+  - 本地增加了 `--log_batch_progress`、`--max_retries`、`--log_generation_ppl`、`--log_generation_token_ppl`、`--log_prefill_decode_timing` 和 `--profile_attention_kernels`，用于观察进度、避免单个样本无限重试，并在 Hugging Face 生成阶段记录 PPL、prefill/decode 耗时和第 0 行样本的 attention kernel profiler。
 - `RULER/scripts/pred/model_wrappers.py`
   - Hugging Face、本地模型和 Mamba wrapper。
   - 本地包含 GLM 配置兼容逻辑。
   - 本地 Hugging Face wrapper 支持基于 `generate(..., output_scores=True)` 的生成答案 token PPL 统计，并可额外返回每个生成 token 的 logprob、NLL 和 PPL 明细。
+  - 本地 Hugging Face wrapper 可用 CUDA event 记录每条样本的 prefill/decode forward 耗时；也可用 `torch.profiler` 对每个任务第 0 行样本统计严格 attention CUDA kernel 时间。
 - `RULER/scripts/eval/evaluate.py`
   - RULER 原生评分入口。
   - 读取预测 jsonl，按 `RULER/scripts/eval/synthetic/constants.py` 中的 metric 计算每个任务分数。
 - `RULER/scripts/eval/collect_results.py`
   - 本地统一汇总脚本。
-  - 跨模型、长度和任务读取预测 jsonl、生成阶段 PPL 字段和 runner timing jsonl。
+  - 跨模型、长度和任务读取预测 jsonl、生成阶段 PPL 字段、`<任务>.generation_timing.jsonl` 和 runner timing jsonl。
   - 输出一组 csv 文件：主文件 `ruler_results.csv` 为 `detail` 明细，其余表写到同名前缀的 `summary_by_model`、`summary_by_model_and_length`、`summary_by_task` 和 `run_info` csv 文件。
 - `RULER/benchmark_root/parquet_data/synthetic/`
   - `RULER/scripts/data/prepare_parquet.py` 生成的 RULER jsonl 输入数据。
@@ -168,6 +169,8 @@
 - `generation_ppl`：开启 `--log_generation_ppl` 后写入，计算方式为 `exp(generation_nll)`。
 
 如果开启 `--log_generation_token_ppl`，`RULER/scripts/pred/call_api.py` 会额外写出 sidecar 文件 `<任务>.generation_tokens.jsonl`。每行对应一个样本，包含 `index`、`task`、`generation_token_count` 和 `tokens`；`tokens` 中每个元素记录生成 token 的 `position`、`token_id`、`token`、`logprob`、`nll` 和 `ppl`。该 token 级 PPL 仍然是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
+
+如果开启 `--log_prefill_decode_timing` 或 `--profile_attention_kernels`，`RULER/scripts/pred/call_api.py` 会额外写出 sidecar 文件 `<任务>.generation_timing.jsonl`。其中 `record_type=sample_timing` 每条样本一行，记录 `sample_line_no`、`sample_index`、`prefill_forward_ms`、`decode_forward_ms_total`、`decode_forward_ms_per_token_avg` 和 `generated_token_count`；`record_type=attention_profile` 每个任务最多一行，固定采输入 jsonl 第 0 行，记录 `sample_line_no=0`、原始 `sample_index`、`prefill_attention_kernel_ms`、`decode_attention_kernel_ms_total`、`decode_attention_kernel_ms_per_token_avg` 和 `attention_kernel_event_count`。`prefill/decode forward` 耗时是完整 forward 阶段耗时；`attention_kernel` 字段才是 profiler 按 kernel 名称过滤后的严格 GPU attention 时间。
 
 评分时，`RULER/scripts/eval/evaluate.py` 会比较 `pred` 和 `outputs`，并统计空预测数量。
 
@@ -269,13 +272,16 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 - `--top-p`：top-p 采样参数，默认 `1.0`。
 - `--random-seed`：随机种子，默认 `0`。
 - `--stop-words`：逗号分隔的停止词，会透传给模型 wrapper。
-- `--batch-size`：`RULER/scripts/pred/call_api.py` 每次送入模型的样本数。长上下文模型很容易 OOM，保守使用 `1`。
+- `--batch-size`：当前固定为 `1`。传入任何非 `1` 的值都会报错；runner 也始终向 `RULER/scripts/pred/call_api.py` 传 `--batch_size 1`。
 - `--poll-interval`：runner 检查子进程状态和打印进度的间隔秒数，默认 `10`。
 - `--skip-existing`：如果目标预测文件已存在，则跳过该任务。
-- `--overwrite-existing`：启动任务前删除对应任务已有的预测 jsonl、attention 摘要文件、生成 token PPL 明细文件和日志文件，强制重新生成。它不能和 `--skip-existing` 同时使用。
+- `--overwrite-existing`：启动任务前删除对应任务已有的预测 jsonl、attention 摘要文件、生成 token PPL 明细文件、生成 timing 明细文件和日志文件，强制重新生成。它不能和 `--skip-existing` 同时使用。
 - `--log-batch-progress`：让子进程输出 `[BATCH_START]`、`[BATCH_DONE]`、`[BATCH_FAILED]`，runner 会把这些行同步回显并写入日志。
 - `--log-generation-ppl`：让 Hugging Face 子进程在生成阶段写入 `generation_logprob_sum`、`generation_token_count`、`generation_nll` 和 `generation_ppl`。该 PPL 是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
 - `--log-generation-token-ppl`：让 Hugging Face 子进程额外写出 `<任务>.generation_tokens.jsonl`，记录每个生成 token 的 `logprob`、`nll` 和 `ppl`；该参数会自动启用样本级 `--log-generation-ppl`。
+- `--log-prefill-decode-timing`：让 Hugging Face 子进程额外写出 `<任务>.generation_timing.jsonl`，每条样本记录一次 `sample_timing`，包含 prefill/decode forward 阶段耗时。
+- `--profile-attention-kernels`：让 Hugging Face 子进程对每个任务输入 jsonl 第 0 行额外运行一次 `torch.profiler`，写出一条 `attention_profile`，统计严格 attention CUDA kernel 时间。该参数不能和 `--log-attention-scores` 同时使用。
+- `--attention-profile-sample-offset`：当前固定为 `0`，表示只 profile 输入 jsonl 第 0 行；传入其他值会报错。
 - `--timing-file`：结构化任务耗时 jsonl；默认写到 `RULER/benchmark_root/local_eval/ruler_timing.jsonl`。
 - `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 csv 汇总。
 - `--report-file`：统一汇总 csv 主输出路径，必须使用 `.csv` 后缀；默认写到 `RULER/benchmark_root/local_eval/ruler_results.csv`。汇总脚本还会写出同名前缀的 summary 和 run_info csv 文件。
@@ -321,9 +327,11 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --skip-existing
 ```
 
-如果要使用此前确认可运行的较大 batch，可以把 `--batch-size 1` 改成 `--batch-size 15`。如果要覆盖旧结果，应删除 `--skip-existing` 并改用 `--overwrite-existing`。
+当前 workflow 已经固定使用 `--batch-size 1`。如果要覆盖旧结果，应删除 `--skip-existing` 并改用 `--overwrite-existing`。
 
 如果要在预测时记录每个生成 token 的困惑度，应加上 `--log-generation-token-ppl`。该参数会同时保留主预测 jsonl 中的样本级 PPL 字段，并额外为每个任务写出 `<任务>.generation_tokens.jsonl`。
+
+如果要记录每条样本的 prefill/decode forward 耗时和每个任务第 0 行样本的严格 attention kernel 时间，应同时加上 `--log-prefill-decode-timing --profile-attention-kernels`。普通阶段耗时会覆盖每条样本；严格 profiler 固定每个 `model + length + task` 只采输入 jsonl 第 0 行。
 
 如果某个模型需要独立 Python，使用 `--model-python`：
 
@@ -332,7 +340,7 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model-python GLM-4-9B-Chat-1M=/data/czy/miniconda3/envs/<glm-env>/bin/python
 ```
 
-如果需要重新跑已经生成过的任务，不要传 `--skip-existing`，改传 `--overwrite-existing`。该参数会在任务启动前删除对应 `<任务>.jsonl`、`<任务>.attention.jsonl`、`<任务>.attention.md`、`<任务>.generation_tokens.jsonl` 和 `<任务>.log`，然后让 `pred/call_api.py` 从头生成。
+如果需要重新跑已经生成过的任务，不要传 `--skip-existing`，改传 `--overwrite-existing`。该参数会在任务启动前删除对应 `<任务>.jsonl`、`<任务>.attention.jsonl`、`<任务>.attention.md`、`<任务>.generation_tokens.jsonl`、`<任务>.generation_timing.jsonl` 和 `<任务>.log`，然后让 `pred/call_api.py` 从头生成。
 
 ### 5. 直接调用 call_api.py 的场景
 
@@ -368,11 +376,14 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u pred/cal
 - `--temperature`、`--top_k`、`--top_p`、`--random_seed`：生成采样参数。
 - `--stop_words`：逗号分隔停止词。
 - `--threads`：并发线程数。`hf` 和 `gemini` 会被脚本强制设为 `1`。
-- `--batch_size`：每次推理的样本数。
+- `--batch_size`：当前固定为 `1`；传入任何非 `1` 的值都会报错。
 - `--log_batch_progress`：输出 batch 开始、完成和失败日志。
 - `--max_retries`：单个 batch 失败后的最大重试次数，默认 `3`。超过后进程非零退出，runner 会释放该 GPU 并记录失败。
 - `--log_generation_ppl`：仅支持 `--server_type hf`。开启后在每条预测 jsonl 记录中追加生成答案 token 的 PPL 统计字段。
 - `--log_generation_token_ppl`：仅支持 `--server_type hf`。开启后额外写出 `<任务>.generation_tokens.jsonl`，记录每个生成 token 的 `logprob`、`nll` 和 `ppl`，并自动启用 `--log_generation_ppl`。
+- `--log_prefill_decode_timing`：仅支持 `--server_type hf`。开启后额外写出 `<任务>.generation_timing.jsonl` 的 `sample_timing` 记录，每条样本一行。
+- `--profile_attention_kernels`：仅支持 `--server_type hf`。开启后只对输入 jsonl 第 0 行额外写一条 `attention_profile` 记录，用 `torch.profiler` 统计 attention CUDA kernel 时间。
+- `--attention_profile_sample_offset`：当前固定为 `0`；传入其他值会报错。
 
 ### 6. 运行评分和统一测评汇总
 
@@ -403,9 +414,9 @@ conda run --no-capture-output -n model python eval/collect_results.py \
 
 `ruler_results_4k_all_models.csv` 是 `detail` 明细主表，汇总脚本还会生成同名前缀的四个 csv：
 
-- `ruler_results_4k_all_models_summary_by_model.csv`：每个模型一行，包含完成数量、平均分、平均 PPL、`total_task_elapsed_seconds`、`wall_time_seconds` 和样本总数。
-- `ruler_results_4k_all_models_summary_by_model_and_length.csv`：每个 `model + length` 一行，按长度观察分数、PPL 和耗时变化。
-- `ruler_results_4k_all_models_summary_by_task.csv`：每个任务一行，记录平均分、最高分对应模型和长度、平均 PPL 和平均耗时。
+- `ruler_results_4k_all_models_summary_by_model.csv`：每个模型一行，包含完成数量、平均分、平均 PPL、`total_task_elapsed_seconds`、`wall_time_seconds`、prefill/decode forward 聚合耗时、attention profiler 聚合字段和样本总数。
+- `ruler_results_4k_all_models_summary_by_model_and_length.csv`：每个 `model + length` 一行，按长度观察分数、PPL、任务耗时、prefill/decode forward 耗时和 attention profiler 指标变化。
+- `ruler_results_4k_all_models_summary_by_task.csv`：每个任务一行，记录平均分、最高分对应模型和长度、平均 PPL、平均耗时和 timing/profiler 聚合字段。
 - `ruler_results_4k_all_models_run_info.csv`：记录汇总时间、输入目录、模型/长度/任务列表和 score/PPL/time 口径。
 
 ### 7. 检查已有数据和结果
