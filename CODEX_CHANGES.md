@@ -1,5 +1,65 @@
 # CODEX 变更说明
 
+## 2026-05-23 新增 pooling token 与细粒度 attention 对照工具
+
+### 变更文件
+
+- `tools/compare_pooling_attention.py`
+  - 新增 Llama 单样本 attention 对照诊断脚本。
+  - 先对一个 RULER 样例执行确定性生成，再 replay 指定生成 token 的完整 attention。
+  - 按固定 block size 把 prompt token 切成 pooling token/block，同时输出 `max pooling` 和 `avg pooling` 的 block 级注意力分数。
+  - 输出每个原始 prompt token 的 full attention 分数，支持保留每层每 head 的明细；也会保存压缩后的 `attention_detail.npz`。
+  - 默认产物包括 `metadata.json`、`tokens.jsonl`、`pooling_tokens.jsonl`、`fine_tokens.jsonl`、`pooling_vs_fine_summary.jsonl`、`attention_detail.npz` 和 `summary.md`。
+
+- `tests/test_pooling_attention_compare.py`
+  - 新增不依赖 GPU 的单元测试，覆盖 block 切分、max/avg pooling 分数、细粒度 token 分数和输出文件格式。
+
+- `AGENTS.md`
+  - 新增 `tools/compare_pooling_attention.py` 的工具说明、典型运行命令、输出文件说明和限制。
+
+- `CODEX_CHANGES.md`
+  - 记录本次 pooling token attention 对照工具变更。
+
+### 变更目的
+
+本次变更用于检查 top-k block 选择中 pooling token 是否能代表其覆盖的多个原始 token。脚本会在同一个样本上同时给出 pooling token/block 的 `max`、`avg` 分数，以及 block 内每个细粒度 token 在 full attention 中的真实注意力分数，方便直接比较两种 pooling 方法的代表性。
+
+### 运行方式
+
+```bash
+cd /data/czy/ICLR-2027
+conda run --no-capture-output -n model python -u tools/compare_pooling_attention.py \
+  --model-path models/Llama-3.1-8B \
+  --data-file RULER/benchmark_root/parquet_data/synthetic/4096/data/niah_single_1/validation.jsonl \
+  --sample-offset 0 \
+  --query-generated-index 0 \
+  --block-size 128 \
+  --top-k-blocks 8 \
+  --max-new-tokens 128 \
+  --output-dir attention_dumps/pooling_token_compare/llama_niah_single_1_4k_sample0 \
+  --overwrite
+```
+
+如果只想保留汇总分数，并避免在 jsonl 中写入每层每 head 的长明细，可以增加：
+
+```bash
+  --omit-layer-head-details
+```
+
+### 验证方式
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests.test_pooling_attention_compare
+conda run --no-capture-output -n model python -B -m py_compile tools/compare_pooling_attention.py tests/test_pooling_attention_compare.py
+conda run --no-capture-output -n model python -B tools/compare_pooling_attention.py --help
+```
+
+### 假设和限制
+
+- 当前服务器 CUDA 仍不可用时，真实 Llama 跑数命令无法完成；脚本实现和单元测试不依赖 GPU。
+- 该脚本只做诊断分析，不实现或替换真实稀疏 attention kernel。
+- 默认主比较口径是跨 layer/head 平均后的 token attention；每层每 head 的完整数值保存在 jsonl 明细和 `attention_detail.npz` 中。
+
 ## 2026-05-21 新增 RULER prefill/decode timing 和首样本 attention profiler
 
 ### 变更文件

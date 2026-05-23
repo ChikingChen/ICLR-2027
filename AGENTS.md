@@ -94,6 +94,7 @@
   - 本地辅助诊断脚本，不属于 RULER 原生流程。
   - `tools/dump_llama_attention.py` 用于对一个 Llama 样本导出生成阶段的完整 attention。
   - `tools/inspect_attention_dump.py` 用于查看某个生成 token、某一层、某个 head 的完整 attention 分布表格。
+  - `tools/compare_pooling_attention.py` 用于对比一个 Llama 样本中 max/avg pooling token block 分数和细粒度 full attention token 分数。
   - `tools/count_ruler_samples.py` 用于统计转换后 RULER jsonl 输入中，4k 到 64k 各长度、各任务的样本数。
 - `ruler_sample_counts_4k_64k.csv`
   - 当前工作区 4k、8k、16k、32k、64k 样本数统计输出。
@@ -487,6 +488,35 @@ conda run --no-capture-output -n model python tools/inspect_attention_dump.py \
 ```
 
 这个工具默认用于本地 Llama 诊断场景，不保证 GLM、Qwen、Yi 的自定义模型代码可直接复用。完整 attention 文件会比较大，长上下文或较多生成 token 时需要提前确认磁盘空间。
+
+### 9. Llama pooling token 与细粒度 attention 对照
+
+`tools/compare_pooling_attention.py` 是独立诊断脚本，不接入 `RULER/scripts/pred/call_api.py`，也不修改 benchmark 预测输出。它适合检查 top-k block 选择中 pooling token 是否能代表其覆盖的多个原始 token：脚本会对一个样本生成回答，replay 指定生成 token 的 full attention，然后按固定 block size 输出 max pooling、avg pooling 的 block 级分数，以及 block 内每个细粒度 token 在 full attention 中的真实注意力分数。
+
+典型运行命令：
+
+```bash
+cd /data/czy/ICLR-2027
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u tools/compare_pooling_attention.py \
+  --model-path models/Llama-3.1-8B \
+  --data-file RULER/benchmark_root/parquet_data/synthetic/4096/data/niah_single_1/validation.jsonl \
+  --sample-offset 0 \
+  --query-generated-index 0 \
+  --block-size 128 \
+  --top-k-blocks 8 \
+  --max-new-tokens 128 \
+  --output-dir attention_dumps/pooling_token_compare/llama_niah_single_1_4k_sample0 \
+  --overwrite
+```
+
+主要输出文件：
+
+- `pooling_tokens.jsonl`：每行一个 pooling token/block，包含 `pooling_score_max`、`pooling_score_avg`、`full_attention_sum`、`rank_by_max` 和 `rank_by_avg` 等字段。
+- `fine_tokens.jsonl`：每行一个原始 prompt token，包含所属 `block_id`、token 文本和 full attention 分数；默认还包含每层每 head 明细。
+- `pooling_vs_fine_summary.jsonl`：每行一个 block，把 pooling 分数和该 block 覆盖的原始 token attention 分数放在一起，便于直接对照。
+- `attention_detail.npz`：压缩保存完整 `[num_layers, num_heads, key_position]` attention 数组。
+
+如果不想在 jsonl 中写入每层每 head 的长明细，可以加 `--omit-layer-head-details`，此时完整矩阵仍保留在 `attention_detail.npz` 中。
 
 ## 任务含义速查
 
