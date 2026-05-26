@@ -2,6 +2,7 @@
 """对比 pooling token 分数和细粒度 full attention 分数。"""
 
 import argparse
+import csv
 import json
 import shutil
 from pathlib import Path
@@ -14,6 +15,33 @@ try:
     from attention_mask_utils import apply_bos_attention_mask, disabled_attention_mask_ablation
 except ImportError:
     from tools.attention_mask_utils import apply_bos_attention_mask, disabled_attention_mask_ablation
+
+
+POOLING_ATTENTION_CSV_FIELDS = [
+    "sample_index",
+    "query_generated_index",
+    "query_token_id",
+    "query_token_text",
+    "layer",
+    "head",
+    "block_id",
+    "start_position",
+    "end_position",
+    "token_count",
+    "token_positions",
+    "token_ids",
+    "token_texts",
+    "fine_attention_values",
+    "fine_attention_sum",
+    "avg_pooling_attention",
+    "max_pooling_attention",
+    "avg_minus_sum",
+    "max_minus_sum",
+    "avg_equals_sum",
+    "max_equals_sum",
+    "avg_over_sum",
+    "max_over_sum",
+]
 
 
 def read_jsonl_sample(path: Path, sample_offset: int) -> Dict[str, Any]:
@@ -40,6 +68,28 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as file_obj:
         for row in rows:
             file_obj.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def write_csv(path: Path, rows: Iterable[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    """写入 CSV 文件。"""
+
+    with path.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def compact_float(value: float) -> float:
+    """把 numpy/float32 值整理成适合 CSV 和 JSON 展示的浮点数。"""
+
+    return float(f"{float(value):.8g}")
+
+
+def json_cell(value: Any) -> str:
+    """把列表值编码成一个稳定的 CSV 单元格。"""
+
+    return json.dumps(value, ensure_ascii=False)
 
 
 def clean_token_text(text: str) -> str:
@@ -366,6 +416,78 @@ def build_pooling_comparison(
     }
 
 
+def build_pooling_attention_csv_rows(
+    attention: np.ndarray,
+    prompt_tokens: Sequence[Dict[str, Any]],
+    block_size: int,
+    metadata: Dict[str, Any] | None = None,
+    tolerance: float = 1e-8,
+) -> List[Dict[str, Any]]:
+    """按 layer/head/block 展开 pooling 分数和细粒度 attention 之和的 CSV 行。"""
+
+    if attention.ndim != 3:
+        raise ValueError(f"attention 必须是 [layer, head, key_position]，实际为 {attention.shape}")
+    if block_size <= 0:
+        raise ValueError("block_size 必须大于 0")
+
+    prompt_length = len(prompt_tokens)
+    if prompt_length > attention.shape[-1]:
+        raise ValueError(
+            f"prompt token 数 {prompt_length} 超过 attention key 长度 {attention.shape[-1]}"
+        )
+
+    metadata = metadata or {}
+    prompt_attention = attention[:, :, :prompt_length].astype(np.float64, copy=False)
+    blocks = build_prompt_blocks(prompt_length, block_size)
+    rows: List[Dict[str, Any]] = []
+
+    for layer in range(prompt_attention.shape[0]):
+        for head in range(prompt_attention.shape[1]):
+            for block in blocks:
+                start = block["start_position"]
+                end_exclusive = block["end_position"] + 1
+                block_tokens = prompt_tokens[start:end_exclusive]
+                raw_values = prompt_attention[layer, head, start:end_exclusive]
+                values = [compact_float(value) for value in raw_values.tolist()]
+                fine_sum = compact_float(sum(values))
+                avg_pooling = compact_float(fine_sum / len(values)) if values else 0.0
+                max_pooling = compact_float(max(values)) if values else 0.0
+                avg_minus_sum = compact_float(avg_pooling - fine_sum)
+                max_minus_sum = compact_float(max_pooling - fine_sum)
+                avg_equals_sum = abs(avg_pooling - fine_sum) <= tolerance
+                max_equals_sum = abs(max_pooling - fine_sum) <= tolerance
+
+                rows.append(
+                    {
+                        "sample_index": metadata.get("sample_index", ""),
+                        "query_generated_index": metadata.get("query_generated_index", ""),
+                        "query_token_id": metadata.get("query_token_id", ""),
+                        "query_token_text": metadata.get("query_token_text", ""),
+                        "layer": layer,
+                        "head": head,
+                        "block_id": block["block_id"],
+                        "start_position": start,
+                        "end_position": block["end_position"],
+                        "token_count": block["token_count"],
+                        "token_positions": json_cell([int(token["position"]) for token in block_tokens]),
+                        "token_ids": json_cell([int(token["token_id"]) for token in block_tokens]),
+                        "token_texts": json_cell([token["token_text"] for token in block_tokens]),
+                        "fine_attention_values": json_cell(values),
+                        "fine_attention_sum": fine_sum,
+                        "avg_pooling_attention": avg_pooling,
+                        "max_pooling_attention": max_pooling,
+                        "avg_minus_sum": avg_minus_sum,
+                        "max_minus_sum": max_minus_sum,
+                        "avg_equals_sum": avg_equals_sum,
+                        "max_equals_sum": max_equals_sum,
+                        "avg_over_sum": compact_float(avg_pooling / fine_sum) if fine_sum else "",
+                        "max_over_sum": compact_float(max_pooling / fine_sum) if fine_sum else "",
+                    }
+                )
+
+    return rows
+
+
 def format_top_block_table(rows: Sequence[Dict[str, Any]], selected_key: str, rank_key: str) -> List[str]:
     """把选中的 top block 格式化成 Markdown 表格。"""
 
@@ -445,6 +567,18 @@ def write_outputs(
     write_jsonl(output_dir / "pooling_tokens.jsonl", comparison["pooling_tokens"])
     write_jsonl(output_dir / "fine_tokens.jsonl", comparison["fine_tokens"])
     write_jsonl(output_dir / "pooling_vs_fine_summary.jsonl", comparison["pooling_vs_fine_summary"])
+    prompt_tokens = (
+        [token for token in tokens if token.get("source") == "prompt"]
+        if tokens is not None
+        else comparison["fine_tokens"]
+    )
+    csv_rows = build_pooling_attention_csv_rows(
+        attention=attention,
+        prompt_tokens=prompt_tokens,
+        block_size=int(metadata["block_size"]),
+        metadata=metadata,
+    )
+    write_csv(output_dir / "pooling_attention_comparison.csv", csv_rows, POOLING_ATTENTION_CSV_FIELDS)
     np.savez_compressed(output_dir / "attention_detail.npz", attention=attention)
     write_summary_markdown(output_dir / "summary.md", metadata, comparison)
 
@@ -484,6 +618,11 @@ def build_metadata(
         "attention_semantics": (
             "attention_detail.npz 保存指定生成 query token 的 attention，形状为 "
             "[num_layers, num_heads, key_position]。pooling 分数只比较 prompt blocks。"
+        ),
+        "pooling_attention_csv_semantics": (
+            "pooling_attention_comparison.csv 按 layer/head/block 展开；fine_attention_sum "
+            "是不 pooling 时 block 内普通 token attention 之和，avg_pooling_attention 是均值，"
+            "max_pooling_attention 是最大值。"
         ),
         "prompt_attention_mass_mean": float(prompt_mass_by_layer_head.mean()),
         "prompt_attention_mass_min": float(prompt_mass_by_layer_head.min()),

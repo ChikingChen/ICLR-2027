@@ -1,5 +1,50 @@
 # CODEX 变更说明
 
+## 2026-05-26 新增 pooling attention CSV 汇总
+
+### 变更文件
+
+- `tools/compare_pooling_attention.py`
+  - 新增 `pooling_attention_comparison.csv` 输出。
+  - CSV 按 `layer + head + block` 展开，记录 block 内普通 token attention 列表、attention 之和、avg pooling 分数、max pooling 分数、差值和是否相等。
+  - `metadata.json` 补充 CSV 统计口径说明。
+
+- `tests/test_pooling_attention_compare.py`
+  - 新增 CSV 行生成和文件写出测试，验证 `sum / avg / max` 三种口径。
+
+### 变更目的
+
+本次变更用于更直观地检查一个 pooling block 是否能代表其覆盖的普通 token：如果 block 内多个 token 被压成一个 pooling token，可直接在 CSV 中比较普通 token attention 之和与 max/avg pooling 分数的差异。
+
+### 运行方式
+
+```bash
+cd /data/czy/ICLR-2027
+CUDA_VISIBLE_DEVICES=2 conda run --no-capture-output -n model python -u tools/compare_pooling_attention.py \
+  --model-path models/Llama-3.1-8B \
+  --data-file RULER/benchmark_root/parquet_data/synthetic/4096/data/niah_single_1/validation.jsonl \
+  --sample-offset 0 \
+  --query-generated-index 0 \
+  --block-size 32 \
+  --top-k-blocks 8 \
+  --max-new-tokens 128 \
+  --output-dir attention_dumps/pooling_token_compare/llama_niah_single_1_4k_sample0_block32 \
+  --overwrite
+```
+
+重点查看：
+
+```text
+attention_dumps/pooling_token_compare/llama_niah_single_1_4k_sample0_block32/pooling_attention_comparison.csv
+```
+
+### 验证方式
+
+```bash
+conda run --no-capture-output -n model python -m unittest tests.test_pooling_attention_compare
+conda run --no-capture-output -n model python -B -m py_compile tools/compare_pooling_attention.py tests/test_pooling_attention_compare.py
+```
+
 ## 2026-05-26 接入 RULER 批量 BOS mask 评测链路
 
 ### 2026-05-26 追加修复
