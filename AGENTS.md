@@ -474,6 +474,12 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u tools/du
   --overwrite
 ```
 
+如果要保留 `<|begin_of_text|>` token 但禁止生成和 replay 阶段 attend 到它，用于对比 BOS token 作为 attention sink 的影响，可以额外加：
+
+```bash
+  --mask-bos-token
+```
+
 查看第 0 个生成 token、第 0 层、第 0 个 head 的完整分布：
 
 ```bash
@@ -509,12 +515,16 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u tools/co
   --overwrite
 ```
 
+如果要跑遮住 `<|begin_of_text|>` 的 pooling 对照实验，可以额外加 `--mask-bos-token`。该参数不会从 `input_ids` 删除 BOS token，而是将它在 prompt 的 `attention_mask` 置为 0，并在生成和 replay attention 时保留原始 position ids，从而只测试“不能 attend 到 BOS”这一项变化。
+
 主要输出文件：
 
 - `pooling_tokens.jsonl`：每行一个 pooling token/block，包含 `pooling_score_max`、`pooling_score_avg`、`full_attention_sum`、`rank_by_max` 和 `rank_by_avg` 等字段。
 - `fine_tokens.jsonl`：每行一个原始 prompt token，包含所属 `block_id`、token 文本和 full attention 分数；默认还包含每层每 head 明细。
 - `pooling_vs_fine_summary.jsonl`：每行一个 block，把 pooling 分数和该 block 覆盖的原始 token attention 分数放在一起，便于直接对照。
 - `attention_detail.npz`：压缩保存完整 `[num_layers, num_heads, key_position]` attention 数组。
+
+开启 `--mask-bos-token` 后，`metadata.json` 会记录 `attention_mask_ablation`，prompt token 明细中 position 0 会带有 `attention_mask=0` 和 `masked=true`。
 
 如果不想在 jsonl 中写入每层每 head 的长明细，可以加 `--omit-layer-head-details`，此时完整矩阵仍保留在 `attention_detail.npz` 中。
 

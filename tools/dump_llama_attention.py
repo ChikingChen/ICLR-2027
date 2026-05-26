@@ -10,6 +10,11 @@ from typing import Any, Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 
+try:
+    from attention_mask_utils import apply_bos_attention_mask, disabled_attention_mask_ablation
+except ImportError:
+    from tools.attention_mask_utils import apply_bos_attention_mask, disabled_attention_mask_ablation
+
 
 def read_jsonl_sample(path: Path, sample_offset: int) -> Dict[str, Any]:
     """读取 jsonl 中指定偏移位置的样本。"""
@@ -53,7 +58,13 @@ def decode_token(tokenizer, token_id: int) -> str:
         return str(token_id)
 
 
-def build_token_records(tokenizer, token_ids: Sequence[int], source: str, start_position: int = 0) -> List[Dict[str, Any]]:
+def build_token_records(
+    tokenizer,
+    token_ids: Sequence[int],
+    source: str,
+    start_position: int = 0,
+    attention_mask_values: Sequence[int] | None = None,
+) -> List[Dict[str, Any]]:
     """构造 token 元数据记录。"""
 
     rows: List[Dict[str, Any]] = []
@@ -64,6 +75,10 @@ def build_token_records(tokenizer, token_ids: Sequence[int], source: str, start_
             "token_id": int(token_id),
             "token_text": decode_token(tokenizer, int(token_id)),
         }
+        if attention_mask_values is not None:
+            mask_value = int(attention_mask_values[local_index])
+            row["attention_mask"] = mask_value
+            row["masked"] = mask_value == 0
         if source == "generated":
             row["generated_index"] = local_index
             row["attention_file"] = attention_filename(local_index)
@@ -104,6 +119,8 @@ def build_metadata(
     num_heads: int,
     dtype: str,
     attention_files: List[Dict[str, Any]],
+    generated_text: str = "",
+    attention_mask_ablation: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """构造导出目录的元数据。"""
 
@@ -118,6 +135,9 @@ def build_metadata(
         "num_layers": num_layers,
         "num_heads": num_heads,
         "dtype": dtype,
+        "generated_text": generated_text,
+        "generated_text_preview": clean_token_text(generated_text[:200]),
+        "attention_mask_ablation": attention_mask_ablation or disabled_attention_mask_ablation(),
         "attention_semantics": "每个 token_XXXX.npy 保存第 XXXX 个生成 token 作为 query 时，对 prompt 和已生成上下文的 attention。",
         "attention_shape": "[num_layers, num_heads, key_length]",
         "attention_files": attention_files,
@@ -139,6 +159,8 @@ def write_summary(path: Path, metadata: Dict[str, Any]) -> None:
         f"- 层数：{metadata['num_layers']}",
         f"- head 数：{metadata['num_heads']}",
         f"- dtype：`{metadata['dtype']}`",
+        f"- BOS attention mask：`{metadata['attention_mask_ablation']['enabled']}`",
+        f"- 生成文本预览：`{metadata['generated_text_preview']}`",
         f"- attention shape：`{metadata['attention_shape']}`",
         "",
         "| 生成 token | 文件 | shape | 最大归一化误差 |",
@@ -263,6 +285,13 @@ def dump_generated_attention(
             outputs = model(
                 input_ids=current_token,
                 attention_mask=attention_mask,
+                position_ids=torch.tensor(
+                    [[inputs["input_ids"].shape[1] + generated_index]],
+                    device=get_input_device(model),
+                    dtype=torch.long,
+                )
+                if "position_ids" in inputs
+                else None,
                 past_key_values=past_key_values,
                 use_cache=True,
                 output_attentions=True,
@@ -295,10 +324,23 @@ def run_dump(args: argparse.Namespace) -> None:
     device = get_input_device(model)
     inputs = tokenizer(prompt_text, return_tensors="pt")
     inputs = {key: value.to(device) for key, value in inputs.items()}
+    if args.mask_bos_token:
+        inputs, attention_mask_ablation = apply_bos_attention_mask(inputs, tokenizer)
+    else:
+        attention_mask_ablation = disabled_attention_mask_ablation()
     prompt_token_ids = inputs["input_ids"][0].detach().cpu().tolist()
     generated_token_ids = generate_tokens(model, inputs, max_new_tokens=args.max_new_tokens)
+    generated_text = tokenizer.decode(generated_token_ids.tolist(), skip_special_tokens=True)
 
-    prompt_tokens = build_token_records(tokenizer, prompt_token_ids, source="prompt")
+    prompt_attention_mask = inputs.get("attention_mask")
+    prompt_tokens = build_token_records(
+        tokenizer,
+        prompt_token_ids,
+        source="prompt",
+        attention_mask_values=None
+        if prompt_attention_mask is None
+        else prompt_attention_mask[0].detach().cpu().tolist(),
+    )
     generated_tokens = build_token_records(
         tokenizer,
         generated_token_ids.tolist(),
@@ -326,6 +368,8 @@ def run_dump(args: argparse.Namespace) -> None:
         num_heads=first_shape[1],
         dtype=args.dtype,
         attention_files=attention_files,
+        generated_text=generated_text,
+        attention_mask_ablation=attention_mask_ablation,
     )
 
     write_json(args.output_dir / "metadata.json", metadata)
@@ -345,6 +389,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dtype", choices=("float32", "float16"), default="float32")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--mask-bos-token",
+        action="store_true",
+        help="保留 BOS token，但将其 attention_mask 置 0，用于测试遮住 <|begin_of_text|> 的影响。",
+    )
     parser.add_argument("--overwrite", action="store_true", help="覆盖已经存在的输出目录。")
     return parser
 

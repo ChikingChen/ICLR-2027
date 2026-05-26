@@ -10,6 +10,11 @@ from typing import Any, Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 
+try:
+    from attention_mask_utils import apply_bos_attention_mask, disabled_attention_mask_ablation
+except ImportError:
+    from tools.attention_mask_utils import apply_bos_attention_mask, disabled_attention_mask_ablation
+
 
 def read_jsonl_sample(path: Path, sample_offset: int) -> Dict[str, Any]:
     """读取 jsonl 文件中指定 offset 的样本。"""
@@ -58,6 +63,7 @@ def build_token_records(
     token_ids: Sequence[int],
     source: str,
     start_position: int = 0,
+    attention_mask_values: Sequence[int] | None = None,
 ) -> List[Dict[str, Any]]:
     """构造 prompt 或 generated token 的元数据记录。"""
 
@@ -69,6 +75,10 @@ def build_token_records(
             "token_id": int(token_id),
             "token_text": decode_token(tokenizer, int(token_id)),
         }
+        if attention_mask_values is not None:
+            mask_value = int(attention_mask_values[local_index])
+            row["attention_mask"] = mask_value
+            row["masked"] = mask_value == 0
         if source == "generated":
             row["generated_index"] = local_index
         rows.append(row)
@@ -190,6 +200,13 @@ def replay_query_attention(
             outputs = model(
                 input_ids=current_token,
                 attention_mask=attention_mask,
+                position_ids=torch.tensor(
+                    [[inputs["input_ids"].shape[1] + generated_index]],
+                    device=get_input_device(model),
+                    dtype=torch.long,
+                )
+                if "position_ids" in inputs
+                else None,
                 past_key_values=past_key_values,
                 use_cache=True,
                 output_attentions=generated_index == query_generated_index,
@@ -388,6 +405,8 @@ def write_summary_markdown(path: Path, metadata: Dict[str, Any], comparison: Dic
         f"- query token：`{metadata.get('query_token_text', '')}` ({metadata.get('query_token_id', '')})",
         f"- prompt token 数：{metadata.get('prompt_token_count', '')}",
         f"- block size：{metadata.get('block_size', '')}",
+        f"- BOS attention mask：`{metadata.get('attention_mask_ablation', {}).get('enabled', False)}`",
+        f"- 生成文本预览：`{metadata.get('generated_text_preview', '')}`",
         "",
         "## Max Pooling Top Blocks",
         "",
@@ -436,6 +455,8 @@ def build_metadata(
     prompt_token_count: int,
     generated_tokens: Sequence[Dict[str, Any]],
     attention: np.ndarray,
+    generated_text: str = "",
+    attention_mask_ablation: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """构造本次对照实验的元数据。"""
 
@@ -454,6 +475,9 @@ def build_metadata(
         "query_generated_index": query_index,
         "query_token_id": int(query_token["token_id"]),
         "query_token_text": query_token["token_text"],
+        "generated_text": generated_text,
+        "generated_text_preview": clean_token_text(generated_text[:200]),
+        "attention_mask_ablation": attention_mask_ablation or disabled_attention_mask_ablation(),
         "prompt_token_count": int(prompt_token_count),
         "generated_token_count": int(len(generated_tokens)),
         "attention_shape": [int(dim) for dim in attention.shape],
@@ -478,13 +502,26 @@ def run_compare(args: argparse.Namespace) -> None:
     device = get_input_device(model)
     inputs = tokenizer(prompt_text, return_tensors="pt")
     inputs = {key: value.to(device) for key, value in inputs.items()}
+    if args.mask_bos_token:
+        inputs, attention_mask_ablation = apply_bos_attention_mask(inputs, tokenizer)
+    else:
+        attention_mask_ablation = disabled_attention_mask_ablation()
 
     prompt_token_ids = inputs["input_ids"][0].detach().cpu().tolist()
     generated_token_ids = generate_tokens(model, inputs, max_new_tokens=args.max_new_tokens)
     if int(generated_token_ids.numel()) == 0:
         raise RuntimeError("模型没有生成新 token，无法对比 pooling attention")
+    generated_text = tokenizer.decode(generated_token_ids.tolist(), skip_special_tokens=True)
 
-    prompt_tokens = build_token_records(tokenizer, prompt_token_ids, source="prompt")
+    prompt_attention_mask = inputs.get("attention_mask")
+    prompt_tokens = build_token_records(
+        tokenizer,
+        prompt_token_ids,
+        source="prompt",
+        attention_mask_values=None
+        if prompt_attention_mask is None
+        else prompt_attention_mask[0].detach().cpu().tolist(),
+    )
     generated_tokens = build_token_records(
         tokenizer,
         generated_token_ids.tolist(),
@@ -511,6 +548,8 @@ def run_compare(args: argparse.Namespace) -> None:
         prompt_token_count=len(prompt_token_ids),
         generated_tokens=generated_tokens,
         attention=attention,
+        generated_text=generated_text,
+        attention_mask_ablation=attention_mask_ablation,
     )
     write_outputs(
         output_dir=args.output_dir,
@@ -541,6 +580,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--omit-layer-head-details",
         action="store_true",
         help="不在 jsonl 中写入每层每 head 明细；仍会写出 attention_detail.npz。",
+    )
+    parser.add_argument(
+        "--mask-bos-token",
+        action="store_true",
+        help="保留 BOS token，但将其 attention_mask 置 0，用于测试遮住 <|begin_of_text|> 的影响。",
     )
     parser.add_argument("--overwrite", action="store_true", help="覆盖非空输出目录。")
     return parser

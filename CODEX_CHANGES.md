@@ -1,5 +1,86 @@
 # CODEX 变更说明
 
+## 2026-05-26 新增 Llama BOS token attention mask 实验开关
+
+### 变更文件
+
+- `tools/attention_mask_utils.py`
+  - 新增共享 BOS attention mask ablation helper。
+  - `--mask-bos-token` 语义固定为保留 `<|begin_of_text|>` token，但将 position 0 的 `attention_mask` 置为 0，并显式保留原始 `position_ids`。
+
+- `tools/dump_llama_attention.py`
+  - 新增 `--mask-bos-token` 参数。
+  - 支持在完整 attention dump 实验中遮住 tokenizer 自动插入的 BOS token。
+  - `metadata.json` 和 `summary.md` 新增生成文本预览和 `attention_mask_ablation` 元信息。
+  - `prompt_tokens.jsonl` 新增 `attention_mask` 和 `masked` 字段，便于确认 position 0 是否被遮住。
+
+- `tools/compare_pooling_attention.py`
+  - 新增 `--mask-bos-token` 参数。
+  - 支持在 pooling token 与细粒度 attention 对照实验中使用同一条 BOS mask 生成和 replay 路径。
+  - `metadata.json`、`summary.md` 和 `tokens.jsonl` 同步记录遮蔽元信息。
+
+- `tests/test_attention_dump_tools.py`
+  - 新增 BOS mask helper、错误场景、token mask 字段和 metadata 字段测试。
+
+- `tests/test_pooling_attention_compare.py`
+  - 新增 pooling 工具 BOS mask helper 和 CLI 参数测试。
+
+- `AGENTS.md`
+  - 补充 `--mask-bos-token` 的用途、语义和输出字段说明。
+
+### 变更目的
+
+本次变更用于对比 Llama 生成时 `<|begin_of_text|>` 作为序列起点和潜在 attention sink 的影响。实验不会删除 BOS token，而是在生成和 KV cache replay 阶段禁止后续 token attend 到它，从而观察生成文本、完整 attention 分布和 pooling block 排名的变化。
+
+### 运行方式
+
+完整 attention dump 的遮蔽实验：
+
+```bash
+cd /data/czy/ICLR-2027
+CUDA_VISIBLE_DEVICES=2 conda run --no-capture-output -n model python -u tools/dump_llama_attention.py \
+  --model-path models/Llama-3.1-8B \
+  --data-file RULER/benchmark_root/parquet_data/synthetic/4096/data/niah_single_1/validation.jsonl \
+  --sample-offset 0 \
+  --output-dir attention_dumps/llama_niah_single_1_4k_sample0_mask_bos \
+  --dtype float32 \
+  --max-new-tokens 128 \
+  --mask-bos-token \
+  --overwrite
+```
+
+pooling token 对照的遮蔽实验：
+
+```bash
+cd /data/czy/ICLR-2027
+CUDA_VISIBLE_DEVICES=2 conda run --no-capture-output -n model python -u tools/compare_pooling_attention.py \
+  --model-path models/Llama-3.1-8B \
+  --data-file RULER/benchmark_root/parquet_data/synthetic/4096/data/niah_single_1/validation.jsonl \
+  --sample-offset 0 \
+  --query-generated-index 0 \
+  --block-size 128 \
+  --top-k-blocks 8 \
+  --max-new-tokens 128 \
+  --output-dir attention_dumps/pooling_token_compare/llama_niah_single_1_4k_sample0_mask_bos \
+  --mask-bos-token \
+  --overwrite
+```
+
+### 验证方式
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests.test_attention_dump_tools tests.test_pooling_attention_compare
+conda run --no-capture-output -n model python -B -m py_compile tools/attention_mask_utils.py tools/dump_llama_attention.py tools/compare_pooling_attention.py tests/test_attention_dump_tools.py tests/test_pooling_attention_compare.py
+conda run --no-capture-output -n model python -B tools/dump_llama_attention.py --help
+conda run --no-capture-output -n model python -B tools/compare_pooling_attention.py --help
+```
+
+### 假设和限制
+
+- `--mask-bos-token` 只支持 batch size 1 的本地单样本诊断工具。
+- 如果 tokenizer 编码后的第 0 个 token 不是 `bos_token_id`，脚本会直接报错，避免遮错 token。
+- 当前变更不接入 RULER 批量 benchmark runner。
+
 ## 2026-05-23 新增 pooling token 与细粒度 attention 对照工具
 
 ### 变更文件

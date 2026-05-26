@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,46 @@ def _load_module():
 
 class PoolingAttentionCompareTest(unittest.TestCase):
     """验证 pooling token 和细粒度 token attention 的对照格式。"""
+
+    def test_apply_bos_attention_mask_zeroes_bos_for_pooling_tool(self):
+        tool = _load_module()
+
+        self.assertTrue(hasattr(tool, "apply_bos_attention_mask"))
+
+        class FakeTokenizer:
+            bos_token_id = 128000
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                return "<|begin_of_text|>" if token_ids == [128000] else str(token_ids[0])
+
+        inputs = {
+            "input_ids": torch.tensor([[128000, 11, 12]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+        }
+
+        masked_inputs, ablation = tool.apply_bos_attention_mask(inputs, FakeTokenizer())
+
+        self.assertEqual(masked_inputs["attention_mask"].tolist(), [[0, 1, 1]])
+        self.assertEqual(masked_inputs["position_ids"].tolist(), [[0, 1, 2]])
+        self.assertTrue(ablation["enabled"])
+        self.assertEqual(ablation["token_text"], "<|begin_of_text|>")
+
+    def test_build_parser_accepts_mask_bos_token_flag(self):
+        tool = _load_module()
+
+        args = tool.build_parser().parse_args(
+            [
+                "--model-path",
+                "models/Llama-3.1-8B",
+                "--data-file",
+                "sample.jsonl",
+                "--output-dir",
+                "out",
+                "--mask-bos-token",
+            ]
+        )
+
+        self.assertTrue(args.mask_bos_token)
 
     def test_build_prompt_blocks_splits_tokens_into_fixed_size_ranges(self):
         tool = _load_module()

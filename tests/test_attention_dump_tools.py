@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,65 @@ def _load_module(name, path):
 
 class AttentionDumpToolsTest(unittest.TestCase):
     """验证独立注意力导出和查看工具的数据格式。"""
+
+    def test_apply_bos_attention_mask_zeroes_bos_and_preserves_positions(self):
+        dump_tool = _load_module("dump_llama_attention", DUMP_TOOL_PATH)
+
+        self.assertTrue(hasattr(dump_tool, "apply_bos_attention_mask"))
+
+        class FakeTokenizer:
+            bos_token_id = 128000
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                return "<|begin_of_text|>" if token_ids == [128000] else str(token_ids[0])
+
+        inputs = {
+            "input_ids": torch.tensor([[128000, 11, 12]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+        }
+
+        masked_inputs, ablation = dump_tool.apply_bos_attention_mask(inputs, FakeTokenizer())
+
+        self.assertEqual(masked_inputs["attention_mask"].tolist(), [[0, 1, 1]])
+        self.assertEqual(masked_inputs["position_ids"].tolist(), [[0, 1, 2]])
+        self.assertEqual(inputs["attention_mask"].tolist(), [[1, 1, 1]])
+        self.assertTrue(ablation["enabled"])
+        self.assertEqual(ablation["token_position"], 0)
+        self.assertEqual(ablation["token_id"], 128000)
+        self.assertEqual(ablation["token_text"], "<|begin_of_text|>")
+
+    def test_apply_bos_attention_mask_rejects_missing_bos_at_position_zero(self):
+        dump_tool = _load_module("dump_llama_attention", DUMP_TOOL_PATH)
+
+        class FakeTokenizer:
+            bos_token_id = 128000
+
+        inputs = {
+            "input_ids": torch.tensor([[11, 12]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        }
+
+        with self.assertRaisesRegex(ValueError, "expected BOS token id 128000 at position 0"):
+            dump_tool.apply_bos_attention_mask(inputs, FakeTokenizer())
+
+    def test_prompt_token_records_include_attention_mask_state(self):
+        dump_tool = _load_module("dump_llama_attention", DUMP_TOOL_PATH)
+
+        class FakeTokenizer:
+            def decode(self, token_ids, skip_special_tokens=False):
+                return {128000: "<|begin_of_text|>", 11: "A"}[token_ids[0]]
+
+        rows = dump_tool.build_token_records(
+            FakeTokenizer(),
+            [128000, 11],
+            source="prompt",
+            attention_mask_values=[0, 1],
+        )
+
+        self.assertEqual(rows[0]["attention_mask"], 0)
+        self.assertTrue(rows[0]["masked"])
+        self.assertEqual(rows[1]["attention_mask"], 1)
+        self.assertFalse(rows[1]["masked"])
 
     def test_dump_helpers_write_metadata_tokens_and_summary(self):
         dump_tool = _load_module("dump_llama_attention", DUMP_TOOL_PATH)
@@ -60,6 +120,15 @@ class AttentionDumpToolsTest(unittest.TestCase):
                         "max_sum_error": 0.0,
                     }
                 ],
+                generated_text="answer",
+                attention_mask_ablation={
+                    "enabled": True,
+                    "mode": "bos_token",
+                    "token_position": 0,
+                    "token_id": 128000,
+                    "token_text": "<|begin_of_text|>",
+                    "semantics": "token kept in input_ids; attention_mask is 0 during generation and replay",
+                },
             )
 
             dump_tool.write_json(output_dir / "metadata.json", metadata)
@@ -70,6 +139,8 @@ class AttentionDumpToolsTest(unittest.TestCase):
             loaded = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(loaded["sample_index"], 7)
             self.assertEqual(loaded["attention_files"][0]["shape"], [2, 2, 3])
+            self.assertEqual(loaded["generated_text"], "answer")
+            self.assertTrue(loaded["attention_mask_ablation"]["enabled"])
             self.assertIn("完整 Attention 导出摘要", (output_dir / "summary.md").read_text(encoding="utf-8"))
 
     def test_attention_array_validation_requires_layer_head_position_shape_and_unit_sum(self):
