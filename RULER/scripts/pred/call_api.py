@@ -98,6 +98,7 @@ parser.add_argument("--log_generation_token_ppl", action="store_true", help="额
 parser.add_argument("--log_prefill_decode_timing", action="store_true", help="输出 Hugging Face prefill/decode forward 阶段耗时。")
 parser.add_argument("--profile_attention_kernels", action="store_true", help="对每个任务第 0 行样本额外统计严格 attention CUDA kernel 时间。")
 parser.add_argument("--attention_profile_sample_offset", type=int, default=0, help="固定为 0，只 profile 输入 jsonl 第 0 行样本。")
+parser.add_argument("--mask_bos_token", action="store_true", help="保留 BOS token，但把 position 0 的 attention_mask 置为 0。")
 
 
 def validate_runtime_args(parsed_args):
@@ -115,6 +116,8 @@ def validate_runtime_args(parsed_args):
         raise ValueError("--log_generation_ppl 和 --log_generation_token_ppl 目前只支持 --server_type hf")
     if (parsed_args.log_prefill_decode_timing or parsed_args.profile_attention_kernels) and parsed_args.server_type != "hf":
         raise ValueError("--log_prefill_decode_timing 和 --profile_attention_kernels 目前只支持 --server_type hf")
+    if parsed_args.mask_bos_token and parsed_args.server_type != "hf":
+        raise ValueError("--mask_bos_token 目前只支持 --server_type hf")
     if parsed_args.profile_attention_kernels and parsed_args.log_attention_scores:
         raise ValueError("--profile_attention_kernels 需要保持 flash attention 路径，不能和 --log_attention_scores 同时使用。")
     if parsed_args.attention_profile_sample_offset != 0:
@@ -218,6 +221,7 @@ def get_llm(tokens_to_generate):
             log_generation_token_ppl=args.log_generation_token_ppl,
             log_prefill_decode_timing=args.log_prefill_decode_timing,
             profile_attention_kernels=args.profile_attention_kernels,
+            mask_bos_token=args.mask_bos_token,
         )
     
     elif args.server_type == 'mamba':
@@ -362,6 +366,7 @@ def build_prediction_record(pred, index, input_text, outputs, others, truncation
         "generation_token_count",
         "generation_nll",
         "generation_ppl",
+        "attention_mask_ablation",
     ):
         if isinstance(pred, dict) and field in pred:
             record[field] = pred[field]

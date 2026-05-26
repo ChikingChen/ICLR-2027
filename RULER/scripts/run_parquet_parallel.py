@@ -84,6 +84,7 @@ class RunnerConfig(NamedTuple):
     log_prefill_decode_timing: bool
     profile_attention_kernels: bool
     attention_profile_sample_offset: int
+    mask_bos_token: bool
     overwrite_existing: bool
     timing_file: Path
     auto_evaluate: bool
@@ -329,6 +330,8 @@ def build_call_api_command(job: Job, config: RunnerConfig) -> List[str]:
     if config.profile_attention_kernels:
         command.append("--profile_attention_kernels")
         command.extend(["--attention_profile_sample_offset", str(config.attention_profile_sample_offset)])
+    if config.mask_bos_token:
+        command.append("--mask_bos_token")
     return command
 
 
@@ -451,6 +454,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="固定为 0，只 profile 输入 jsonl 第 0 行样本。",
     )
     parser.add_argument(
+        "--mask-bos-token",
+        action="store_true",
+        help="保留 BOS token，但把 position 0 的 attention_mask 置为 0，用于遮住 <|begin_of_text|> 的实验。",
+    )
+    parser.add_argument(
         "--timing-file",
         type=Path,
         help="结构化任务耗时 jsonl；默认写到 output-root/ruler_timing.jsonl。",
@@ -520,6 +528,7 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         log_prefill_decode_timing=args.log_prefill_decode_timing,
         profile_attention_kernels=args.profile_attention_kernels,
         attention_profile_sample_offset=args.attention_profile_sample_offset,
+        mask_bos_token=args.mask_bos_token,
         overwrite_existing=args.overwrite_existing,
         timing_file=timing_file,
         auto_evaluate=args.auto_evaluate,

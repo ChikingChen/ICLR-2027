@@ -45,6 +45,7 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertIn("--log_prefill_decode_timing", source)
         self.assertIn("--profile_attention_kernels", source)
         self.assertIn("--attention_profile_sample_offset", source)
+        self.assertIn("--mask_bos_token", source)
         self.assertIn("[BATCH_START]", source)
         self.assertIn("[BATCH_DONE]", source)
         self.assertIn("[BATCH_FAILED]", source)
@@ -66,6 +67,26 @@ class CallApiProgressTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "batch_size.*1"):
+            module.validate_runtime_args(parsed)
+
+    def test_validate_runtime_args_rejects_mask_bos_token_for_non_hf_backend(self):
+        module = _load_call_api_module()
+
+        parsed = module.parser.parse_args(
+            [
+                "--data_dir",
+                "/tmp/ruler-data",
+                "--save_dir",
+                "/tmp/ruler-pred",
+                "--task",
+                "niah_single_1",
+                "--server_type",
+                "openai",
+                "--mask_bos_token",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "mask_bos_token.*hf"):
             module.validate_runtime_args(parsed)
 
     def test_attention_profile_sample_is_first_input_record(self):

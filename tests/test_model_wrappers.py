@@ -133,6 +133,98 @@ class ModelWrappersTest(unittest.TestCase):
         self.assertEqual(summary["generated_token_count"], 3)
         self.assertAlmostEqual(summary["decode_forward_ms_per_token_avg"], 2.0)
 
+    def test_mask_bos_inputs_for_generation_zeroes_bos_and_preserves_positions(self):
+        module = _load_module()
+
+        class FakeTokenizer:
+            bos_token_id = 128000
+
+            def decode(self, token_ids, skip_special_tokens=False):
+                return "<|begin_of_text|>" if token_ids == [128000] else str(token_ids[0])
+
+        inputs = {
+            "input_ids": torch.tensor([[128000, 11, 12]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+        }
+
+        masked_inputs, ablation = module.mask_bos_inputs_for_generation(inputs, FakeTokenizer())
+
+        self.assertEqual(masked_inputs["attention_mask"].tolist(), [[0, 1, 1]])
+        self.assertEqual(masked_inputs["position_ids"].tolist(), [[0, 1, 2]])
+        self.assertEqual(inputs["attention_mask"].tolist(), [[1, 1, 1]])
+        self.assertTrue(ablation["enabled"])
+        self.assertEqual(ablation["token_position"], 0)
+        self.assertEqual(ablation["token_id"], 128000)
+        self.assertEqual(ablation["token_text"], "<|begin_of_text|>")
+
+    def test_mask_bos_inputs_for_generation_rejects_missing_bos(self):
+        module = _load_module()
+
+        class FakeTokenizer:
+            bos_token_id = 128000
+
+        inputs = {
+            "input_ids": torch.tensor([[11, 12]], dtype=torch.long),
+            "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        }
+
+        with self.assertRaisesRegex(ValueError, "expected BOS token id 128000 at position 0"):
+            module.mask_bos_inputs_for_generation(inputs, FakeTokenizer())
+
+    def test_generate_inputs_drop_position_ids_when_bos_is_masked(self):
+        module = _load_module()
+        wrapper = object.__new__(module.HuggingFaceModel)
+        wrapper.mask_bos_token = True
+        inputs = {
+            "input_ids": torch.tensor([[128000, 11, 12]], dtype=torch.long),
+            "attention_mask": torch.tensor([[0, 1, 1]], dtype=torch.long),
+            "position_ids": torch.tensor([[0, 1, 2]], dtype=torch.long),
+        }
+
+        generate_inputs = wrapper._inputs_for_generate(inputs)
+
+        self.assertNotIn("position_ids", generate_inputs)
+        self.assertIn("position_ids", inputs)
+
+    def test_masked_bos_prepare_uses_cache_position_for_position_ids(self):
+        module = _load_module()
+        wrapper = object.__new__(module.HuggingFaceModel)
+        wrapper.mask_bos_token = True
+
+        class FakeModel:
+            def prepare_inputs_for_generation(
+                self,
+                input_ids,
+                past_key_values=None,
+                attention_mask=None,
+                inputs_embeds=None,
+                cache_position=None,
+                **kwargs,
+            ):
+                return {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": torch.full_like(input_ids, 99),
+                }
+
+        wrapper.model = FakeModel()
+
+        with wrapper._preserve_positions_for_masked_bos_generation():
+            prefill_inputs = wrapper.model.prepare_inputs_for_generation(
+                torch.tensor([[128000, 11, 12]], dtype=torch.long),
+                attention_mask=torch.tensor([[0, 1, 1]], dtype=torch.long),
+                cache_position=torch.tensor([0, 1, 2], dtype=torch.long),
+            )
+            decode_inputs = wrapper.model.prepare_inputs_for_generation(
+                torch.tensor([[13]], dtype=torch.long),
+                past_key_values=object(),
+                attention_mask=torch.tensor([[0, 1, 1, 1]], dtype=torch.long),
+                cache_position=torch.tensor([3], dtype=torch.long),
+            )
+
+        self.assertEqual(prefill_inputs["position_ids"].tolist(), [[0, 1, 2]])
+        self.assertEqual(decode_inputs["position_ids"].tolist(), [[3]])
+
     def test_attention_kernel_summary_filters_attention_events(self):
         module = _load_module()
 

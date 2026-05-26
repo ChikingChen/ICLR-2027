@@ -1,4 +1,5 @@
 import importlib.util
+import csv
 import json
 import tempfile
 import unittest
@@ -127,6 +128,64 @@ class PoolingAttentionCompareTest(unittest.TestCase):
         self.assertEqual([token["position"] for token in summary[0]["tokens"]], [0, 1])
         self.assertEqual(summary[0]["tokens"][0]["token_text"], "A")
 
+    def test_build_pooling_attention_csv_rows_reports_layer_head_block_comparison(self):
+        tool = _load_module()
+        attention = np.array(
+            [
+                [
+                    [0.10, 0.20, 0.30, 0.40],
+                    [0.20, 0.10, 0.50, 0.20],
+                ],
+                [
+                    [0.05, 0.25, 0.20, 0.50],
+                    [0.15, 0.35, 0.25, 0.25],
+                ],
+            ],
+            dtype=np.float32,
+        )
+        token_records = [
+            {"position": 0, "source": "prompt", "token_id": 10, "token_text": "A"},
+            {"position": 1, "source": "prompt", "token_id": 11, "token_text": "B"},
+            {"position": 2, "source": "prompt", "token_id": 12, "token_text": "C"},
+            {"position": 3, "source": "prompt", "token_id": 13, "token_text": "D"},
+        ]
+
+        rows = tool.build_pooling_attention_csv_rows(
+            attention=attention,
+            prompt_tokens=token_records,
+            block_size=2,
+            metadata={
+                "sample_index": 7,
+                "query_generated_index": 0,
+                "query_token_id": 25,
+                "query_token_text": ":",
+            },
+        )
+
+        self.assertEqual(len(rows), 8)
+        first = rows[0]
+        self.assertEqual(first["sample_index"], 7)
+        self.assertEqual(first["query_generated_index"], 0)
+        self.assertEqual(first["query_token_text"], ":")
+        self.assertEqual(first["layer"], 0)
+        self.assertEqual(first["head"], 0)
+        self.assertEqual(first["block_id"], 0)
+        self.assertEqual(first["start_position"], 0)
+        self.assertEqual(first["end_position"], 1)
+        self.assertEqual(first["token_count"], 2)
+        self.assertEqual(first["token_positions"], "[0, 1]")
+        self.assertEqual(first["token_texts"], "[\"A\", \"B\"]")
+        self.assertEqual(first["fine_attention_values"], "[0.1, 0.2]")
+        self.assertAlmostEqual(first["fine_attention_sum"], 0.3)
+        self.assertAlmostEqual(first["avg_pooling_attention"], 0.15)
+        self.assertAlmostEqual(first["max_pooling_attention"], 0.2)
+        self.assertAlmostEqual(first["avg_minus_sum"], -0.15)
+        self.assertAlmostEqual(first["max_minus_sum"], -0.1)
+        self.assertFalse(first["avg_equals_sum"])
+        self.assertFalse(first["max_equals_sum"])
+        self.assertAlmostEqual(first["avg_over_sum"], 0.5)
+        self.assertAlmostEqual(first["max_over_sum"], 2.0 / 3.0)
+
     def test_write_outputs_persists_pooling_and_fine_attention_files(self):
         tool = _load_module()
         comparison = {
@@ -196,6 +255,106 @@ class PoolingAttentionCompareTest(unittest.TestCase):
             self.assertEqual(summary_row["tokens"][0]["position"], 0)
             self.assertTrue((output_dir / "attention_detail.npz").exists())
             self.assertIn("Pooling Token", (output_dir / "summary.md").read_text(encoding="utf-8"))
+
+    def test_write_outputs_persists_pooling_attention_comparison_csv(self):
+        tool = _load_module()
+        comparison = {
+            "pooling_tokens": [
+                {
+                    "block_id": 0,
+                    "start_position": 0,
+                    "end_position": 1,
+                    "token_count": 2,
+                    "pooling_score_max": 0.2,
+                    "pooling_score_avg": 0.15,
+                    "full_attention_sum": 0.3,
+                    "full_attention_mean": 0.15,
+                    "full_attention_max": 0.2,
+                    "rank_by_max": 1,
+                    "rank_by_avg": 1,
+                    "selected_by_max": True,
+                    "selected_by_avg": True,
+                }
+            ],
+            "fine_tokens": [
+                {
+                    "position": 0,
+                    "block_id": 0,
+                    "token_id": 10,
+                    "token_text": "A",
+                    "full_attention_mean": 0.1,
+                    "full_attention_max": 0.2,
+                    "full_attention_min": 0.0,
+                },
+                {
+                    "position": 1,
+                    "block_id": 0,
+                    "token_id": 11,
+                    "token_text": "B",
+                    "full_attention_mean": 0.2,
+                    "full_attention_max": 0.3,
+                    "full_attention_min": 0.0,
+                },
+            ],
+            "pooling_vs_fine_summary": [
+                {
+                    "block_id": 0,
+                    "start_position": 0,
+                    "end_position": 1,
+                    "pooling_score_max": 0.2,
+                    "pooling_score_avg": 0.15,
+                    "full_attention_sum": 0.3,
+                    "tokens": [
+                        {
+                            "position": 0,
+                            "token_id": 10,
+                            "token_text": "A",
+                            "full_attention_mean": 0.1,
+                            "full_attention_max": 0.2,
+                        },
+                        {
+                            "position": 1,
+                            "token_id": 11,
+                            "token_text": "B",
+                            "full_attention_mean": 0.2,
+                            "full_attention_max": 0.3,
+                        },
+                    ],
+                }
+            ],
+        }
+        metadata = {
+            "model_path": "models/Llama-3.1-8B",
+            "block_size": 2,
+            "sample_index": 7,
+            "query_generated_index": 0,
+            "query_token_id": 25,
+            "query_token_text": ":",
+        }
+        attention = np.array([[[0.1, 0.2]]], dtype=np.float32)
+        tokens = [
+            {"position": 0, "source": "prompt", "token_id": 10, "token_text": "A"},
+            {"position": 1, "source": "prompt", "token_id": 11, "token_text": "B"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            tool.write_outputs(output_dir, metadata, comparison, attention, tokens=tokens)
+
+            with (output_dir / "pooling_attention_comparison.csv").open(
+                newline="", encoding="utf-8"
+            ) as file_obj:
+                rows = list(csv.DictReader(file_obj))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["token_positions"], "[0, 1]")
+            self.assertEqual(rows[0]["token_texts"], "[\"A\", \"B\"]")
+            self.assertEqual(rows[0]["fine_attention_values"], "[0.1, 0.2]")
+            self.assertEqual(float(rows[0]["fine_attention_sum"]), 0.3)
+            self.assertEqual(float(rows[0]["avg_pooling_attention"]), 0.15)
+            self.assertEqual(float(rows[0]["max_pooling_attention"]), 0.2)
+            self.assertEqual(rows[0]["avg_equals_sum"], "False")
+            self.assertEqual(rows[0]["max_equals_sum"], "False")
 
 
 if __name__ == "__main__":

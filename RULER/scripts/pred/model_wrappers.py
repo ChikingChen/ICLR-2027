@@ -18,6 +18,7 @@ import json
 import requests
 import time
 import torch
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 
@@ -47,6 +48,53 @@ def decode_attention_token(tokenizer, token_id: int) -> str:
         text = str(token_id)
     text = text.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
     return text if text else "<empty>"
+
+
+def mask_bos_inputs_for_generation(inputs, tokenizer) -> tuple:
+    """保留 BOS token，但让后续生成不能 attend 到 position 0。"""
+
+    if "input_ids" not in inputs:
+        raise ValueError("inputs must contain input_ids")
+    input_ids = inputs["input_ids"]
+    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        raise ValueError("mask_bos_token only supports batch_size=1 inputs")
+
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_token_id is None:
+        raise ValueError("tokenizer does not define bos_token_id")
+
+    first_token_id = int(input_ids[0, 0].item())
+    if first_token_id != int(bos_token_id):
+        raise ValueError(
+            f"expected BOS token id {bos_token_id} at position 0, found {first_token_id}"
+        )
+
+    masked_inputs = dict(inputs)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = attention_mask.clone()
+    if attention_mask.shape != input_ids.shape:
+        raise ValueError("attention_mask shape must match input_ids shape")
+
+    attention_mask[0, 0] = 0
+    position_ids = torch.arange(
+        input_ids.shape[1],
+        device=input_ids.device,
+        dtype=torch.long,
+    ).unsqueeze(0)
+    masked_inputs["attention_mask"] = attention_mask
+    masked_inputs["position_ids"] = position_ids
+
+    return masked_inputs, {
+        "enabled": True,
+        "mode": "bos_token",
+        "token_position": 0,
+        "token_id": first_token_id,
+        "token_text": decode_attention_token(tokenizer, first_token_id),
+        "semantics": "token kept in input_ids; attention_mask is 0 during generation",
+    }
 
 
 def summarize_attention_layers(
@@ -336,6 +384,7 @@ class HuggingFaceModel:
         self.log_generation_token_ppl = bool(generation_kwargs.pop("log_generation_token_ppl", False))
         self.log_prefill_decode_timing = bool(generation_kwargs.pop("log_prefill_decode_timing", False))
         self.profile_attention_kernels = bool(generation_kwargs.pop("profile_attention_kernels", False))
+        self.mask_bos_token = bool(generation_kwargs.pop("mask_bos_token", False))
         if self.log_generation_token_ppl:
             self.log_generation_ppl = True
         self.attention_top_k = int(generation_kwargs.pop("attention_top_k", 8))
@@ -353,6 +402,7 @@ class HuggingFaceModel:
             or self.log_generation_ppl
             or self.log_prefill_decode_timing
             or self.profile_attention_kernels
+            or self.mask_bos_token
         ):
             self.pipeline = None
             try:
@@ -406,6 +456,77 @@ class HuggingFaceModel:
     def __call__(self, prompt: str, **kwargs) -> dict:
         return self.process_batch([prompt], **kwargs)[0]
 
+    def _prepare_generation_inputs(self, prompts: List[str], padding: bool) -> tuple:
+        """Tokenize prompts and optionally apply the BOS attention-mask ablation."""
+
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding).to(self.model.device)
+        if not self.mask_bos_token:
+            return inputs, None
+        return mask_bos_inputs_for_generation(inputs, self.tokenizer)
+
+    def _inputs_for_generate(self, inputs) -> dict:
+        """Return generate kwargs, avoiding position_ids validation failures."""
+
+        if not self.mask_bos_token or "position_ids" not in inputs:
+            return inputs
+        generate_inputs = dict(inputs)
+        generate_inputs.pop("position_ids", None)
+        return generate_inputs
+
+    @contextmanager
+    def _preserve_positions_for_masked_bos_generation(self):
+        """Inject position_ids from cache_position while BOS is masked."""
+
+        if not self.mask_bos_token:
+            yield
+            return
+
+        original_prepare = self.model.prepare_inputs_for_generation
+
+        def prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=None,
+            attention_mask=None,
+            inputs_embeds=None,
+            cache_position=None,
+            **kwargs,
+        ):
+            kwargs.pop("position_ids", None)
+            model_inputs = original_prepare(
+                input_ids,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            input_tensor = model_inputs.get("input_ids")
+            if input_tensor is None:
+                input_tensor = model_inputs.get("inputs_embeds")
+            if input_tensor is None:
+                return model_inputs
+
+            current_length = int(input_tensor.shape[1])
+            if cache_position is None:
+                position_ids = torch.arange(
+                    current_length,
+                    dtype=torch.long,
+                    device=input_tensor.device,
+                ).unsqueeze(0)
+            else:
+                position_ids = cache_position.reshape(-1)[-current_length:].to(
+                    dtype=torch.long,
+                    device=input_tensor.device,
+                ).unsqueeze(0)
+            model_inputs["position_ids"] = position_ids
+            return model_inputs
+
+        self.model.prepare_inputs_for_generation = prepare_inputs_for_generation
+        try:
+            yield
+        finally:
+            self.model.prepare_inputs_for_generation = original_prepare
+
     def _generate_with_forward_timing(self, inputs) -> tuple:
         """运行 `generate()` 并用临时 forward wrapper 采集 prefill/decode 耗时。"""
 
@@ -424,10 +545,11 @@ class HuggingFaceModel:
 
         self.model.forward = timed_forward
         try:
-            generated_output = self.model.generate(
-                **inputs,
-                **self.generation_kwargs,
-            )
+            with self._preserve_positions_for_masked_bos_generation():
+                generated_output = self.model.generate(
+                    **self._inputs_for_generate(inputs),
+                    **self.generation_kwargs,
+                )
         finally:
             self.model.forward = original_forward
         return generated_output, collector
@@ -435,20 +557,22 @@ class HuggingFaceModel:
     def _generate_without_timing(self, inputs):
         """运行普通 Hugging Face generate，便于和计时路径共用后处理。"""
 
-        return self.model.generate(
-            **inputs,
-            **self.generation_kwargs,
-        )
+        with self._preserve_positions_for_masked_bos_generation():
+            return self.model.generate(
+                **self._inputs_for_generate(inputs),
+                **self.generation_kwargs,
+            )
 
     def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
         if self.log_attention_scores:
             return [self._process_one_with_attention(prompt) for prompt in prompts]
 
         timing_collector = None
+        attention_mask_ablation = None
         if self.pipeline is None:
             if self.log_prefill_decode_timing and len(prompts) != 1:
                 raise ValueError("prefill/decode timing 只支持 batch_size=1。")
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
+            inputs, attention_mask_ablation = self._prepare_generation_inputs(prompts, padding=True)
             if self.log_prefill_decode_timing:
                 generated_output, timing_collector = self._generate_with_forward_timing(inputs)
             else:
@@ -501,6 +625,8 @@ class HuggingFaceModel:
                 timing = timing_collector.summary(generated_token_count=generated_token_count)
                 timing["input_tokens"] = int(input_length)
                 result["generation_timing"] = timing
+            if attention_mask_ablation is not None:
+                result["attention_mask_ablation"] = attention_mask_ablation
             results.append(result)
 
         return results
@@ -508,7 +634,7 @@ class HuggingFaceModel:
     def _process_one_with_attention(self, prompt: str) -> dict:
         """生成单条样本，并附带首个生成 token 的逐层注意力摘要。"""
 
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=False).to(self.model.device)
+        inputs, attention_mask_ablation = self._prepare_generation_inputs([prompt], padding=False)
         input_length = inputs["input_ids"].shape[1]
         timing_collector = None
         if self.log_prefill_decode_timing:
@@ -532,6 +658,8 @@ class HuggingFaceModel:
             input_length=input_length,
         )
         result = {"text": [text], "attention": attention_summary}
+        if attention_mask_ablation is not None:
+            result["attention_mask_ablation"] = attention_mask_ablation
         if self.log_generation_ppl:
             result.update(
                 compute_generation_ppl_stats(
@@ -585,11 +713,15 @@ class HuggingFaceModel:
 
         decode_token_ids = generated_token_ids[:-1].reshape(-1)
         attention_mask = inputs.get("attention_mask")
+        position_ids = inputs.get("position_ids")
+        next_position = None
+        if position_ids is not None:
+            next_position = int(position_ids[0, -1].item()) + 1
 
         def run_decode():
             nonlocal past_key_values, attention_mask
             with torch.no_grad():
-                for token_id in decode_token_ids:
+                for decode_idx, token_id in enumerate(decode_token_ids):
                     step_inputs = {
                         "input_ids": token_id.reshape(1, 1).to(self.model.device),
                         "past_key_values": past_key_values,
@@ -604,6 +736,12 @@ class HuggingFaceModel:
                         )
                         attention_mask = torch.cat([attention_mask, next_mask], dim=1)
                         step_inputs["attention_mask"] = attention_mask
+                    if next_position is not None:
+                        step_inputs["position_ids"] = torch.tensor(
+                            [[next_position + decode_idx]],
+                            dtype=position_ids.dtype,
+                            device=position_ids.device,
+                        )
                     outputs = self.model(**step_inputs)
                     next_past = getattr(outputs, "past_key_values", None)
                     if next_past is not None:
@@ -618,7 +756,7 @@ class HuggingFaceModel:
         if self.pipeline is not None:
             raise RuntimeError("attention kernel profiling 需要直接 Hugging Face model，不能使用 pipeline。")
 
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=False).to(self.model.device)
+        inputs, attention_mask_ablation = self._prepare_generation_inputs([prompt], padding=False)
         input_length = int(inputs["input_ids"].shape[1])
         result = {
             "timer_backend": "torch_profiler",
@@ -629,6 +767,8 @@ class HuggingFaceModel:
             "decode_attention_kernel_ms_per_token_avg": None,
             "attention_kernel_event_count": 0,
         }
+        if attention_mask_ablation is not None:
+            result["attention_mask_ablation"] = attention_mask_ablation
         if not torch.cuda.is_available():
             result["warning"] = "CUDA 不可用，无法统计严格 GPU attention kernel 时间。"
             return result
@@ -720,6 +860,12 @@ class HuggingFaceModel:
                     device=attention_mask.device,
                 )
                 step_inputs["attention_mask"] = torch.cat([attention_mask, next_mask], dim=1)
+            if "position_ids" in inputs:
+                step_inputs["position_ids"] = torch.tensor(
+                    [[input_length]],
+                    dtype=inputs["position_ids"].dtype,
+                    device=inputs["position_ids"].device,
+                )
             attention_outputs = self.model(**step_inputs)
 
         attentions = getattr(attention_outputs, "attentions", None)

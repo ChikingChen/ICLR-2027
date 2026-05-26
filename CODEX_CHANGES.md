@@ -1,5 +1,108 @@
 # CODEX 变更说明
 
+## 2026-05-26 接入 RULER 批量 BOS mask 评测链路
+
+### 2026-05-26 追加修复
+
+- 修复 `device_map="auto"` 场景下 Accelerate hook 让 `generate()` 参数校验看不到 `position_ids` 的问题。
+- RULER 批量 masked BOS 生成现在不会把 `position_ids` 作为外部 `generate()` 参数传入，而是在 `prepare_inputs_for_generation` 内根据 `cache_position` 注入原始绝对位置，避免 `<|begin_of_text|>` 被遮住后后续 token 的位置整体左移。
+- 新增回归测试覆盖 `generate()` 输入中移除 `position_ids` 和 masked BOS 生成准备阶段按 `cache_position` 写回位置。
+
+### 变更文件
+
+- `RULER/scripts/run_parquet_parallel.py`
+  - 新增 `--mask-bos-token` 参数，并在构造子进程命令时透传为 `pred/call_api.py --mask_bos_token`。
+
+- `RULER/scripts/pred/call_api.py`
+  - 新增 `--mask_bos_token` 参数。
+  - 限定该参数只支持 `--server_type hf`。
+  - 预测 jsonl 额外保留 `attention_mask_ablation` 字段，便于确认本次运行确实使用了 BOS mask。
+
+- `RULER/scripts/pred/model_wrappers.py`
+  - Hugging Face wrapper 支持保留 BOS token、把 position 0 的 `attention_mask` 置为 0，并显式传入原始 `position_ids`。
+  - 该 mask 同步作用于普通生成、PPL 统计、prefill/decode timing、attention summary 和 attention kernel profiler 路径。
+
+- `tests/test_run_parquet_parallel.py`、`tests/test_call_api_progress.py`、`tests/test_model_wrappers.py`
+  - 新增 RULER runner 参数透传、非 HF 后端拒绝和 BOS mask helper 行为测试。
+
+- `AGENTS.md`
+  - 补充 RULER 4k 遮住 `<|begin_of_text|>` 的推荐运行命令和参数说明。
+
+### 推荐命令
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B-mask-bos=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks all \
+  --gpus 2 \
+  --max-workers 1 \
+  --server-type hf \
+  --batch-size 1 \
+  --poll-interval 0.5 \
+  --log-batch-progress \
+  --mask-bos-token \
+  --overwrite-existing \
+  --auto-evaluate \
+  --timing-file ../benchmark_root/local_eval/ruler_timing_4k_llama_mask_bos.jsonl \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_llama_mask_bos.csv
+```
+
+### 验证方式
+
+```bash
+conda run --no-capture-output -n model python -B -m unittest tests.test_run_parquet_parallel tests.test_call_api_progress tests.test_model_wrappers
+```
+
+## 2026-05-26 新增 BOS attention sink 汇总工具
+
+### 变更文件
+
+- `tools/summarize_bos_attention.py`
+  - 新增完整 attention dump 汇总脚本。
+  - 统计 `<|begin_of_text|>` 在所有 `generated token × layer × head` 组合中 attention 是否为 top-1。
+  - 输出 BOS top-1 次数、比例、平均 attention、最小值、最大值和基础元数据。
+  - 默认从 `prompt_tokens.jsonl` 按 token 文本定位 BOS，也支持 `--bos-position` 手动指定。
+
+- `tests/test_attention_dump_tools.py`
+  - 新增 BOS 汇总脚本单元测试，覆盖跨生成 token 统计、缺失 BOS 报错和 CLI 输出。
+
+- `AGENTS.md`
+  - 补充 `tools/summarize_bos_attention.py` 的用途、统计口径和典型命令。
+
+### 变更目的
+
+本次变更用于快速检查完整 attention dump 中 `<|begin_of_text|>` 是否作为 attention sink：脚本不重新跑模型、不修改 dump，只读取已有 `token_XXXX.npy` 文件并汇总 BOS 在所有生成 token、层和 head 上的 attention 排名与平均分配。
+
+### 运行方式
+
+```bash
+cd /data/czy/ICLR-2027
+conda run --no-capture-output -n model python tools/summarize_bos_attention.py \
+  --dump-dir attention_dumps/llama_niah_single_1_4k_sample0
+```
+
+如果自动定位不到 BOS，可以手动指定：
+
+```bash
+  --bos-position 0
+```
+
+### 验证方式
+
+```bash
+conda run --no-capture-output -n model python -m unittest tests.test_attention_dump_tools -v
+conda run --no-capture-output -n model python -B -m py_compile tools/summarize_bos_attention.py tests/test_attention_dump_tools.py
+conda run --no-capture-output -n model python tools/summarize_bos_attention.py --dump-dir attention_dumps/llama_niah_single_1_4k_sample0
+```
+
+### 假设和限制
+
+- “多少个头中注意力第一”按 `generated token × layer × head` 统计，不按静态 head 去重。
+- top-1 判断使用完整 attention vector 的最大值；并列最大时 BOS 也计为第一。
+- 脚本只打印终端汇总，不写新的 json/csv 文件。
+
 ## 2026-05-26 新增 Llama BOS token attention mask 实验开关
 
 ### 变更文件
@@ -77,9 +180,9 @@ conda run --no-capture-output -n model python -B tools/compare_pooling_attention
 
 ### 假设和限制
 
-- `--mask-bos-token` 只支持 batch size 1 的本地单样本诊断工具。
+- 上述单样本诊断工具的 `--mask-bos-token` 仍然只支持 batch size 1。
 - 如果 tokenizer 编码后的第 0 个 token 不是 `bos_token_id`，脚本会直接报错，避免遮错 token。
-- 当前变更不接入 RULER 批量 benchmark runner。
+- RULER 批量 benchmark runner 的 BOS mask 支持见本文件 2026-05-26 的批量评测链路记录。
 
 ## 2026-05-23 新增 pooling token 与细粒度 attention 对照工具
 

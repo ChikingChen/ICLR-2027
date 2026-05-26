@@ -108,6 +108,7 @@ class RunParquetParallelTest(unittest.TestCase):
                 "--log-generation-token-ppl",
                 "--log-prefill-decode-timing",
                 "--profile-attention-kernels",
+                "--mask-bos-token",
             ]
         )
         config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
@@ -123,12 +124,14 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertIn("--log_prefill_decode_timing", command)
         self.assertIn("--profile_attention_kernels", command)
         self.assertIn("--attention_profile_sample_offset", command)
+        self.assertIn("--mask_bos_token", command)
         self.assertIn("--batch_size", command)
         self.assertEqual(command[command.index("--batch_size") + 1], "1")
         self.assertTrue(config.log_generation_ppl)
         self.assertTrue(config.log_generation_token_ppl)
         self.assertTrue(config.log_prefill_decode_timing)
         self.assertTrue(config.profile_attention_kernels)
+        self.assertTrue(config.mask_bos_token)
         self.assertEqual(module.prediction_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/pred/niah_single_1.jsonl"))
         self.assertEqual(module.log_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/logs/niah_single_1.log"))
         self.assertIn("/data/parquet/synthetic/4096/data", command)

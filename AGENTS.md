@@ -94,6 +94,7 @@
   - 本地辅助诊断脚本，不属于 RULER 原生流程。
   - `tools/dump_llama_attention.py` 用于对一个 Llama 样本导出生成阶段的完整 attention。
   - `tools/inspect_attention_dump.py` 用于查看某个生成 token、某一层、某个 head 的完整 attention 分布表格。
+  - `tools/summarize_bos_attention.py` 用于统计完整 attention dump 中 `<|begin_of_text|>` 在所有生成 token、层和 head 上作为 top-1 attention token 的次数和平均 attention。
   - `tools/compare_pooling_attention.py` 用于对比一个 Llama 样本中 max/avg pooling token block 分数和细粒度 full attention token 分数。
   - `tools/count_ruler_samples.py` 用于统计转换后 RULER jsonl 输入中，4k 到 64k 各长度、各任务的样本数。
 - `ruler_sample_counts_4k_64k.csv`
@@ -283,6 +284,7 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 - `--log-prefill-decode-timing`：让 Hugging Face 子进程额外写出 `<任务>.generation_timing.jsonl`，每条样本记录一次 `sample_timing`，包含 prefill/decode forward 阶段耗时。
 - `--profile-attention-kernels`：让 Hugging Face 子进程对每个任务输入 jsonl 第 0 行额外运行一次 `torch.profiler`，写出一条 `attention_profile`，统计严格 attention CUDA kernel 时间。该参数不能和 `--log-attention-scores` 同时使用。
 - `--attention-profile-sample-offset`：当前固定为 `0`，表示只 profile 输入 jsonl 第 0 行；传入其他值会报错。
+- `--mask-bos-token`：仅支持 `--server-type hf`。保留 tokenizer 自动插入的 BOS token，例如 Llama 的 `<|begin_of_text|>`，但把 position 0 的 `attention_mask` 置为 0，并显式保留原始 `position_ids`，用于对比“遮住整段文本起点 token”和正常输入的 RULER 分数差异。开启后预测 jsonl 会保留 `attention_mask_ablation` 元信息。
 - `--timing-file`：结构化任务耗时 jsonl；默认写到 `RULER/benchmark_root/local_eval/ruler_timing.jsonl`。
 - `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 csv 汇总。
 - `--report-file`：统一汇总 csv 主输出路径，必须使用 `.csv` 后缀；默认写到 `RULER/benchmark_root/local_eval/ruler_results.csv`。汇总脚本还会写出同名前缀的 summary 和 run_info csv 文件。
@@ -333,6 +335,27 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
 如果要在预测时记录每个生成 token 的困惑度，应加上 `--log-generation-token-ppl`。该参数会同时保留主预测 jsonl 中的样本级 PPL 字段，并额外为每个任务写出 `<任务>.generation_tokens.jsonl`。
 
 如果要记录每条样本的 prefill/decode forward 耗时和每个任务第 0 行样本的严格 attention kernel 时间，应同时加上 `--log-prefill-decode-timing --profile-attention-kernels`。普通阶段耗时会覆盖每条样本；严格 profiler 固定每个 `model + length + task` 只采输入 jsonl 第 0 行。
+
+如果要跑遮住 `<|begin_of_text|>` 的 RULER 4k 全任务实验，可以给 Llama 单独起一个新的模型别名，并加上 `--mask-bos-token`：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B-mask-bos=../../models/Llama-3.1-8B \
+  --seq-lengths 4096 \
+  --tasks all \
+  --gpus 2 \
+  --max-workers 1 \
+  --server-type hf \
+  --batch-size 1 \
+  --poll-interval 0.5 \
+  --log-batch-progress \
+  --mask-bos-token \
+  --overwrite-existing \
+  --auto-evaluate \
+  --timing-file ../benchmark_root/local_eval/ruler_timing_4k_llama_mask_bos.jsonl \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_llama_mask_bos.csv
+```
 
 如果某个模型需要独立 Python，使用 `--model-python`：
 
@@ -385,6 +408,7 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u pred/cal
 - `--log_prefill_decode_timing`：仅支持 `--server_type hf`。开启后额外写出 `<任务>.generation_timing.jsonl` 的 `sample_timing` 记录，每条样本一行。
 - `--profile_attention_kernels`：仅支持 `--server_type hf`。开启后只对输入 jsonl 第 0 行额外写一条 `attention_profile` 记录，用 `torch.profiler` 统计 attention CUDA kernel 时间。
 - `--attention_profile_sample_offset`：当前固定为 `0`；传入其他值会报错。
+- `--mask_bos_token`：仅支持 `--server_type hf`。保留 BOS token，但把 position 0 的 `attention_mask` 置为 0；适合单独调试遮住 `<|begin_of_text|>` 的一项任务。
 
 ### 6. 运行评分和统一测评汇总
 
@@ -492,6 +516,16 @@ conda run --no-capture-output -n model python tools/inspect_attention_dump.py \
   --sort-by attention \
   --descending
 ```
+
+统计 `<|begin_of_text|>` 在所有 `generated token × layer × head` 组合中 attention 是否排第一，以及它的平均 attention：
+
+```bash
+cd /data/czy/ICLR-2027
+conda run --no-capture-output -n model python tools/summarize_bos_attention.py \
+  --dump-dir attention_dumps/llama_niah_single_1_sample_0
+```
+
+`tools/summarize_bos_attention.py` 默认从 `prompt_tokens.jsonl` 中按 `token_text=<|begin_of_text|>` 定位 BOS token；如果需要手动指定位置，可以额外传 `--bos-position 0`。脚本只打印汇总，不写新的 dump 文件。
 
 这个工具默认用于本地 Llama 诊断场景，不保证 GLM、Qwen、Yi 的自定义模型代码可直接复用。完整 attention 文件会比较大，长上下文或较多生成 token 时需要提前确认磁盘空间。
 

@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -11,6 +13,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 DUMP_TOOL_PATH = ROOT / "tools" / "dump_llama_attention.py"
 INSPECT_TOOL_PATH = ROOT / "tools" / "inspect_attention_dump.py"
+BOS_SUMMARY_TOOL_PATH = ROOT / "tools" / "summarize_bos_attention.py"
 
 
 def _load_module(name, path):
@@ -22,6 +25,85 @@ def _load_module(name, path):
 
 class AttentionDumpToolsTest(unittest.TestCase):
     """验证独立注意力导出和查看工具的数据格式。"""
+
+    def write_bos_summary_dump(self, dump_dir: Path) -> None:
+        (dump_dir / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "sample_index": 7,
+                    "generated_token_count": 2,
+                    "num_layers": 2,
+                    "num_heads": 2,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (dump_dir / "prompt_tokens.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "position": 0,
+                            "source": "prompt",
+                            "token_id": 128000,
+                            "token_text": "<|begin_of_text|>",
+                        }
+                    ),
+                    json.dumps({"position": 1, "source": "prompt", "token_id": 11, "token_text": "A"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (dump_dir / "generated_tokens.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "generated_index": 0,
+                            "position": 2,
+                            "source": "generated",
+                            "token_id": 12,
+                            "token_text": "B",
+                            "attention_file": "token_0000.npy",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "generated_index": 1,
+                            "position": 3,
+                            "source": "generated",
+                            "token_id": 13,
+                            "token_text": "C",
+                            "attention_file": "token_0001.npy",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        np.save(
+            dump_dir / "token_0000.npy",
+            np.array(
+                [
+                    [[0.6, 0.3, 0.1], [0.1, 0.2, 0.7]],
+                    [[0.4, 0.4, 0.2], [0.0, 0.5, 0.5]],
+                ],
+                dtype=np.float32,
+            ),
+        )
+        np.save(
+            dump_dir / "token_0001.npy",
+            np.array(
+                [
+                    [[0.25, 0.25, 0.25, 0.25], [0.8, 0.1, 0.1, 0.0]],
+                    [[0.05, 0.9, 0.03, 0.02], [0.2, 0.2, 0.2, 0.4]],
+                ],
+                dtype=np.float32,
+            ),
+        )
 
     def test_apply_bos_attention_mask_zeroes_bos_and_preserves_positions(self):
         dump_tool = _load_module("dump_llama_attention", DUMP_TOOL_PATH)
@@ -229,6 +311,58 @@ class AttentionDumpToolsTest(unittest.TestCase):
 
         self.assertEqual([row["position"] for row in sorted_rows], [1, 2, 0])
         self.assertEqual([row["position"] for row in rows], [0, 1, 2])
+
+    def test_bos_summary_counts_top1_and_mean_attention_across_generated_layer_heads(self):
+        summary_tool = _load_module("summarize_bos_attention", BOS_SUMMARY_TOOL_PATH)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dump_dir = Path(tmp_dir)
+            self.write_bos_summary_dump(dump_dir)
+
+            summary = summary_tool.summarize_bos_attention(dump_dir)
+
+            self.assertEqual(summary["sample_index"], 7)
+            self.assertEqual(summary["generated_token_count"], 2)
+            self.assertEqual(summary["num_layers"], 2)
+            self.assertEqual(summary["num_heads"], 2)
+            self.assertEqual(summary["total_units"], 8)
+            self.assertEqual(summary["bos_top1_count"], 4)
+            self.assertAlmostEqual(summary["bos_top1_ratio"], 0.5)
+            self.assertAlmostEqual(summary["bos_attention_mean"], 0.3)
+            self.assertAlmostEqual(summary["bos_attention_min"], 0.0)
+            self.assertAlmostEqual(summary["bos_attention_max"], 0.8)
+
+    def test_bos_summary_rejects_missing_bos_token_text(self):
+        summary_tool = _load_module("summarize_bos_attention", BOS_SUMMARY_TOOL_PATH)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dump_dir = Path(tmp_dir)
+            (dump_dir / "metadata.json").write_text("{}", encoding="utf-8")
+            (dump_dir / "prompt_tokens.jsonl").write_text(
+                json.dumps({"position": 0, "source": "prompt", "token_id": 11, "token_text": "A"}) + "\n",
+                encoding="utf-8",
+            )
+            (dump_dir / "generated_tokens.jsonl").write_text("", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Could not find token_text '<\\|begin_of_text\\|>'"):
+                summary_tool.summarize_bos_attention(dump_dir)
+
+    def test_bos_summary_cli_prints_human_readable_totals(self):
+        summary_tool = _load_module("summarize_bos_attention", BOS_SUMMARY_TOOL_PATH)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dump_dir = Path(tmp_dir)
+            self.write_bos_summary_dump(dump_dir)
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = summary_tool.main(["--dump-dir", str(dump_dir)])
+
+            self.assertEqual(exit_code, 0)
+            output = stdout.getvalue()
+            self.assertIn("bos_top1_count: 4", output)
+            self.assertIn("bos_top1_ratio: 0.50000000", output)
+            self.assertIn("bos_attention_mean: 0.30000001", output)
 
 
 if __name__ == "__main__":
