@@ -1,5 +1,49 @@
 # CODEX 变更说明
 
+## 2026-05-27 记录默认三模型口径
+
+### 变更文件
+
+- `AGENTS.md`
+
+### 变更目的
+
+按用户要求记录后续默认不再关注 `Yi-9B-200K`：之后用户说“三个模型”时，默认只指 `Llama-3.1-8B`、`Qwen2.5-7B-Instruct-1M` 和 `GLM-4-9B-Chat-1M`，不包括 Yi。Yi 的本地目录说明仍保留，但新实验、新汇总和三模型命令默认不纳入 Yi，除非用户明确点名。
+
+同时将 4k 全任务示例命令从四模型改为默认三模型，并把示例输出文件名改为 `ruler_results_4k_three_models.csv`。
+
+## 2026-05-27 更新 FlashAttention RULER 分数和 timing 汇总
+
+### 变更文件
+
+- `RULER/benchmark_root/local_eval/FlashAttention/GLM_flashattention_ruler_scores.csv`
+- `RULER/benchmark_root/local_eval/FlashAttention/Llama_flashattention_ruler_scores.csv`
+- `RULER/benchmark_root/local_eval/FlashAttention/Qwen_flashattention_ruler_scores.csv`
+
+### 变更目的
+
+从 `RULER/benchmark_root/local_eval/` 中已有预测结果重新按 RULER 原生 synthetic metric 计算分数，并为 FlashAttention 运行结果单独整理 GLM、Llama 和 Qwen 三个模型的 4k、8k、16k 汇总表。原目录 `flashattention_ruler_scores_4k_8k_16k/` 已重命名为更通用的 `FlashAttention/`，便于后续继续加入其他 benchmark 或长度。
+
+每个 CSV 包含 `length`、13 个 RULER 子任务分数、`overall` 平均分，并在 `overall` 后追加 `avg_prefill_attention_kernel_ms` 和 `avg_decode_attention_kernel_ms_per_token`。这两个 timing 字段来自 `ruler_results_4k_64k_all_models_token_ppl_timing_summary_by_model_and_length.csv`，表示对应 `model + length` 下 13 个任务第 0 条样本 attention profiler 的平均 prefill attention kernel 时间和平均 decode 每 token attention kernel 时间。
+
+### 验证方式
+
+已检查三张 CSV 均为 4 行（含表头）、17 列（`length` + 13 个任务 + `overall` + 2 个 attention timing 字段），数据行顺序均为 `4k`、`8k`、`16k`，新增 timing 字段均为非空数值。
+
+## 2026-05-27 新增 Llama mask BOS RULER 分数汇总
+
+### 变更文件
+
+- `RULER/benchmark_root/local_eval/llama_mask_bos_ruler_scores/Llama_mask_bos_ruler_scores.csv`
+
+### 变更目的
+
+从 `RULER/benchmark_root/local_eval/Llama-3.1-8B-mask-bos/` 中已有预测结果重新按 RULER 原生 synthetic metric 计算分数，并为 Llama 遮住 BOS token 的运行结果单独整理汇总表。当前本地 mask BOS 结果只覆盖 `4096` 长度，因此 CSV 目前只有 `4k` 一行；列结构与 FlashAttention 汇总保持一致，包含 `length`、13 个 RULER 子任务分数和 `overall` 平均分。
+
+### 验证方式
+
+已检查 CSV 为 2 行（含表头）、15 列（`length` + 13 个任务 + `overall`），数据行是 `4k`，所有任务分数和 `overall` 均非空。
+
 ## 2026-05-26 新增 pooling attention CSV 汇总
 
 ### 变更文件

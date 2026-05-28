@@ -41,6 +41,8 @@
 
 当前 `models/` 下可见的模型目录如下：
 
+默认实验口径：后续用户说“三个模型”时，指 `Llama-3.1-8B`、`Qwen2.5-7B-Instruct-1M` 和 `GLM-4-9B-Chat-1M`，不包括 `Yi-9B-200K`。Yi 目录仍保留在本地模型目录说明中，但以后默认不纳入新实验、新汇总或“三模型”命令，除非用户明确点名 Yi。
+
 - `models/Llama-3.1-8B/`
   - 旧环境中曾写作 `models/Meta-Llama-3.1-8B/`，当前目录名已经变化。
   - `config.json` 中 `model_type` 为 `llama`。
@@ -308,25 +310,24 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --log-batch-progress
 ```
 
-跑当前四个模型的 4k 全任务时，模型路径应使用当前目录名：
+跑当前默认三个模型的 4k 全任务时，模型路径应使用当前目录名：
 
 ```bash
 cd /data/czy/ICLR-2027/RULER/scripts
 conda run --no-capture-output -n model python -B run_parquet_parallel.py \
   --model Llama-3.1-8B=../../models/Llama-3.1-8B \
   --model Qwen2.5-7B-Instruct-1M=../../models/Qwen2.5-7B-Instruct-1M \
-  --model Yi-9B-200K=../../models/Yi-9B-200K \
   --model GLM-4-9B-Chat-1M=../../models/GLM-4-9B-Chat-1M \
   --seq-lengths 4096 \
   --tasks all \
-  --gpus 0,2,3,5 \
-  --max-workers 4 \
+  --gpus 0,2,3 \
+  --max-workers 3 \
   --server-type hf \
   --batch-size 1 \
   --poll-interval 10 \
   --log-batch-progress \
   --auto-evaluate \
-  --report-file ../benchmark_root/local_eval/ruler_results_4k_all_models.csv \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_three_models.csv \
   --skip-existing
 ```
 
