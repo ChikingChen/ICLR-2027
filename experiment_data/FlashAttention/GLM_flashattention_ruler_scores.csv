@@ -1,0 +1,4 @@
+length,niah_single_1,niah_single_2,niah_single_3,niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery,vt,cwe,fwe,qa_1,qa_2,overall,avg_prefill_attention_kernel_ms,avg_decode_attention_kernel_ms_per_token
+4k,100,100,100,97.8,99.8,100,97,100,99.96,83.74,88.53,82,59.8,92.9715,79.91772830769241,7.01681010105646
+8k,100,100,100,98.2,99.4,99.6,97.6,99.95,99.88,71.24,92.73,80,56.8,91.9538,254.08793353846153,9.783664814924418
+16k,100,100,100,96.8,98.8,99.6,98.6,99.95,99.96,55.1,94,77.2,58.4,90.6469,960.9950086153844,16.75971313402046

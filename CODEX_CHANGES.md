@@ -1,5 +1,21 @@
 # CODEX 变更说明
 
+## 2026-05-30 移动 FlashAttention baseline 实验数据
+
+### 变更文件
+
+- `experiment_data/FlashAttention/GLM_flashattention_ruler_scores.csv`
+- `experiment_data/FlashAttention/Llama_flashattention_ruler_scores.csv`
+- `experiment_data/FlashAttention/Qwen_flashattention_ruler_scores.csv`
+
+### 变更目的
+
+按用户要求新增顶层实验数据目录 `experiment_data/`，并将原 `RULER/benchmark_root/local_eval/FlashAttention/` 移动到 `experiment_data/FlashAttention/`。该目录作为 FlashAttention baseline 数据目录，保存 GLM、Llama 和 Qwen 三个模型的 RULER 分数与 attention timing 汇总 CSV。
+
+### 验证方式
+
+已检查 `experiment_data/FlashAttention/` 下包含三张 CSV，原 `RULER/benchmark_root/local_eval/FlashAttention/` 路径已不存在。
+
 ## 2026-05-27 记录默认三模型口径
 
 ### 变更文件
