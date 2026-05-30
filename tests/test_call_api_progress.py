@@ -46,6 +46,7 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertIn("--profile_attention_kernels", source)
         self.assertIn("--attention_profile_sample_offset", source)
         self.assertIn("--mask_bos_token", source)
+        self.assertIn("--log_attn_implementation", source)
         self.assertIn("[BATCH_START]", source)
         self.assertIn("[BATCH_DONE]", source)
         self.assertIn("[BATCH_FAILED]", source)
@@ -89,21 +90,48 @@ class CallApiProgressTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mask_bos_token.*hf"):
             module.validate_runtime_args(parsed)
 
-    def test_attention_profile_sample_is_first_input_record(self):
+    def test_validate_runtime_args_rejects_attn_implementation_log_for_non_hf_backend(self):
         module = _load_call_api_module()
 
-        sample = module.select_attention_profile_sample(
+        parsed = module.parser.parse_args(
             [
-                {"index": 41, "input": "第一条"},
-                {"index": 42, "input": "第二条"},
-            ],
-            sample_offset=0,
+                "--data_dir",
+                "/tmp/ruler-data",
+                "--save_dir",
+                "/tmp/ruler-pred",
+                "--task",
+                "niah_single_1",
+                "--server_type",
+                "openai",
+                "--log_attn_implementation",
+            ]
         )
 
-        self.assertEqual(sample["sample_line_no"], 0)
-        self.assertEqual(sample["sample"]["index"], 41)
-        with self.assertRaisesRegex(ValueError, "第 0 行"):
-            module.select_attention_profile_sample([{"index": 41, "input": "第一条"}], sample_offset=1)
+        with self.assertRaisesRegex(ValueError, "log_attn_implementation.*hf"):
+            module.validate_runtime_args(parsed)
+
+    def test_attention_profile_sample_offset_is_accepted_for_compatibility(self):
+        module = _load_call_api_module()
+
+        parsed = module.parser.parse_args(
+            [
+                "--data_dir",
+                "/tmp/ruler-data",
+                "--save_dir",
+                "/tmp/ruler-pred",
+                "--task",
+                "niah_single_1",
+                "--server_type",
+                "hf",
+                "--profile_attention_kernels",
+                "--attention_profile_sample_offset",
+                "3",
+            ]
+        )
+
+        validated = module.validate_runtime_args(parsed)
+
+        self.assertEqual(validated.attention_profile_sample_offset, 3)
 
     def test_process_batch_with_retries_returns_after_transient_failure(self):
         module = _load_call_api_module()
@@ -281,12 +309,12 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertEqual(record["prefill_forward_ms"], 10.0)
         self.assertEqual(record["decode_forward_ms_per_token_avg"], 2.0)
 
-    def test_attention_profile_record_documents_first_sample_policy(self):
+    def test_attention_profile_record_documents_all_sample_policy(self):
         module = _load_call_api_module()
 
         record = module.build_attention_profile_record(
             profile={
-                "timer_backend": "torch_profiler",
+                "timer_backend": "cuda_event_attention_ops",
                 "input_tokens": 128,
                 "generated_token_count": 2,
                 "prefill_attention_kernel_ms": 3.0,
@@ -296,13 +324,13 @@ class CallApiProgressTest(unittest.TestCase):
             },
             task="vt",
             sample={"index": 7},
-            sample_line_no=0,
+            sample_line_no=3,
             input_file=Path("/tmp/validation.jsonl"),
         )
 
         self.assertEqual(record["record_type"], "attention_profile")
-        self.assertEqual(record["profile_sample_policy"], "first_input_record")
-        self.assertEqual(record["sample_line_no"], 0)
+        self.assertEqual(record["profile_sample_policy"], "all_input_records")
+        self.assertEqual(record["sample_line_no"], 3)
         self.assertEqual(record["sample_index"], 7)
         self.assertEqual(record["input_file"], "/tmp/validation.jsonl")
         self.assertEqual(record["prefill_attention_kernel_ms"], 3.0)

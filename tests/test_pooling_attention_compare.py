@@ -63,6 +63,23 @@ class PoolingAttentionCompareTest(unittest.TestCase):
 
         self.assertTrue(args.mask_bos_token)
 
+    def test_build_parser_accepts_true_pooling_attention_flag(self):
+        tool = _load_module()
+
+        args = tool.build_parser().parse_args(
+            [
+                "--model-path",
+                "models/Llama-3.1-8B",
+                "--data-file",
+                "sample.jsonl",
+                "--output-dir",
+                "out",
+                "--true-pooling-attention",
+            ]
+        )
+
+        self.assertTrue(args.true_pooling_attention)
+
     def test_build_prompt_blocks_splits_tokens_into_fixed_size_ranges(self):
         tool = _load_module()
 
@@ -185,6 +202,62 @@ class PoolingAttentionCompareTest(unittest.TestCase):
         self.assertFalse(first["max_equals_sum"])
         self.assertAlmostEqual(first["avg_over_sum"], 0.5)
         self.assertAlmostEqual(first["max_over_sum"], 2.0 / 3.0)
+
+    def test_build_true_pooling_attention_csv_rows_recomputes_softmax_over_blocks(self):
+        tool = _load_module()
+        dense_attention = np.array([[[0.2, 0.3, 0.5]]], dtype=np.float32)
+        query_states = np.array([[[1.0, 0.0]]], dtype=np.float32)
+        key_states = np.array([[[[1.0, 0.0], [0.0, 1.0], [2.0, 0.0]]]], dtype=np.float32)
+
+        rows = tool.build_true_pooling_attention_csv_rows(
+            dense_attention=dense_attention,
+            query_states=query_states,
+            key_states=key_states,
+            block_size=2,
+            query_generated_index=0,
+        )
+
+        self.assertEqual(tool.TRUE_POOLING_ATTENTION_CSV_FIELDS, list(rows[0].keys()))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["query_generated_index"], 0)
+        self.assertEqual(rows[0]["token_range"], "1-2")
+        self.assertEqual(rows[1]["token_range"], "3-3")
+        self.assertAlmostEqual(rows[0]["dense_attention_sum"], 0.5)
+        self.assertAlmostEqual(rows[1]["dense_attention_sum"], 0.5)
+
+        avg_logits = np.array([0.5, 2.0], dtype=np.float64) / np.sqrt(2.0)
+        avg_expected = np.exp(avg_logits - avg_logits.max())
+        avg_expected = avg_expected / avg_expected.sum()
+        max_logits = np.array([1.0, 2.0], dtype=np.float64) / np.sqrt(2.0)
+        max_expected = np.exp(max_logits - max_logits.max())
+        max_expected = max_expected / max_expected.sum()
+
+        self.assertAlmostEqual(rows[0]["avg_pooling_attention"], avg_expected[0])
+        self.assertAlmostEqual(rows[1]["avg_pooling_attention"], avg_expected[1])
+        self.assertAlmostEqual(rows[0]["max_pooling_attention"], max_expected[0])
+        self.assertAlmostEqual(rows[1]["max_pooling_attention"], max_expected[1])
+        self.assertEqual(rows[0]["layer"], 0)
+        self.assertEqual(rows[0]["head"], 0)
+
+    def test_summarize_true_pooling_rows_reports_column_sum_errors(self):
+        tool = _load_module()
+        dense_attention = np.array([[[0.2, 0.3, 0.5]]], dtype=np.float32)
+        query_states = np.array([[[1.0, 0.0]]], dtype=np.float32)
+        key_states = np.array([[[[1.0, 0.0], [0.0, 1.0], [2.0, 0.0]]]], dtype=np.float32)
+        rows = tool.build_true_pooling_attention_csv_rows(
+            dense_attention=dense_attention,
+            query_states=query_states,
+            key_states=key_states,
+            block_size=2,
+            query_generated_index=0,
+        )
+
+        summary = tool.summarize_true_pooling_attention_rows(rows)
+
+        self.assertEqual(summary["row_count"], 2)
+        self.assertAlmostEqual(summary["dense_attention_sum_max_error"], 0.0)
+        self.assertAlmostEqual(summary["avg_pooling_attention_sum_max_error"], 0.0)
+        self.assertAlmostEqual(summary["max_pooling_attention_sum_max_error"], 0.0)
 
     def test_write_outputs_persists_pooling_and_fine_attention_files(self):
         tool = _load_module()
@@ -355,6 +428,50 @@ class PoolingAttentionCompareTest(unittest.TestCase):
             self.assertEqual(float(rows[0]["max_pooling_attention"]), 0.2)
             self.assertEqual(rows[0]["avg_equals_sum"], "False")
             self.assertEqual(rows[0]["max_equals_sum"], "False")
+
+    def test_write_outputs_persists_true_pooling_attention_csv(self):
+        tool = _load_module()
+        comparison = {
+            "pooling_tokens": [],
+            "fine_tokens": [],
+            "pooling_vs_fine_summary": [],
+        }
+        metadata = {
+            "model_path": "models/Llama-3.1-8B",
+            "block_size": 2,
+            "query_generated_index": 0,
+        }
+        attention = np.array([[[1.0]]], dtype=np.float32)
+        true_rows = [
+            {
+                "query_generated_index": 0,
+                "token_range": "1-1",
+                "dense_attention_sum": 1.0,
+                "avg_pooling_attention": 1.0,
+                "max_pooling_attention": 1.0,
+                "layer": 0,
+                "head": 0,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            tool.write_outputs(
+                output_dir,
+                metadata,
+                comparison,
+                attention,
+                true_pooling_rows=true_rows,
+            )
+
+            with (output_dir / "true_pooling_attention_7col_block2.csv").open(
+                newline="", encoding="utf-8"
+            ) as file_obj:
+                rows = list(csv.DictReader(file_obj))
+
+            self.assertEqual(rows[0]["query_generated_index"], "0")
+            self.assertEqual(rows[0]["token_range"], "1-1")
+            self.assertEqual(float(rows[0]["dense_attention_sum"]), 1.0)
 
 
 if __name__ == "__main__":

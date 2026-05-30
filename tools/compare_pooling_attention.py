@@ -4,9 +4,10 @@
 import argparse
 import csv
 import json
+import math
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -41,6 +42,16 @@ POOLING_ATTENTION_CSV_FIELDS = [
     "max_equals_sum",
     "avg_over_sum",
     "max_over_sum",
+]
+
+TRUE_POOLING_ATTENTION_CSV_FIELDS = [
+    "query_generated_index",
+    "token_range",
+    "dense_attention_sum",
+    "avg_pooling_attention",
+    "max_pooling_attention",
+    "layer",
+    "head",
 ]
 
 
@@ -84,6 +95,21 @@ def compact_float(value: float) -> float:
     """把 numpy/float32 值整理成适合 CSV 和 JSON 展示的浮点数。"""
 
     return float(f"{float(value):.8g}")
+
+
+def stable_softmax(values: np.ndarray) -> np.ndarray:
+    """对一维 logits 做数值稳定 softmax。"""
+
+    if values.ndim != 1:
+        raise ValueError(f"softmax 输入必须是一维数组，实际为 {values.shape}")
+    if values.size == 0:
+        return values.astype(np.float64, copy=True)
+    shifted = values.astype(np.float64, copy=False) - float(np.max(values))
+    exp_values = np.exp(shifted)
+    total = float(exp_values.sum())
+    if total == 0.0:
+        raise ValueError("softmax logits 产生了 0 分母")
+    return exp_values / total
 
 
 def json_cell(value: Any) -> str:
@@ -154,6 +180,30 @@ def get_input_device(model) -> torch.device:
         return next(model.parameters()).device
 
 
+def repeat_key_value_heads(key_states: torch.Tensor, num_key_value_groups: int) -> torch.Tensor:
+    """把 GQA/MQA key heads repeat 到 query head 数。"""
+
+    if num_key_value_groups == 1:
+        return key_states
+    batch, num_key_value_heads, sequence_length, head_dim = key_states.shape
+    key_states = key_states[:, :, None, :, :].expand(
+        batch,
+        num_key_value_heads,
+        num_key_value_groups,
+        sequence_length,
+        head_dim,
+    )
+    return key_states.reshape(batch, num_key_value_heads * num_key_value_groups, sequence_length, head_dim)
+
+
+def cache_key_for_layer(past_key_values: Any, layer_idx: int) -> torch.Tensor:
+    """从 Transformers cache 或 tuple cache 中取某一层的 key tensor。"""
+
+    if hasattr(past_key_values, "key_cache"):
+        return past_key_values.key_cache[layer_idx]
+    return past_key_values[layer_idx][0]
+
+
 def load_llama_model(model_path: Path):
     """加载本地 Llama 模型和 tokenizer，并优先启用 eager attention。"""
 
@@ -207,6 +257,111 @@ def stack_step_attentions(attentions: Sequence[torch.Tensor], dtype: str) -> np.
     return stacked.astype(np.float32)
 
 
+def find_llama_attention_modules(model) -> List[Any]:
+    """返回带 q/k projection 的 Llama attention 模块。"""
+
+    modules = []
+    for module in model.modules():
+        if all(hasattr(module, attr) for attr in ("q_proj", "k_proj", "head_dim", "num_key_value_groups")):
+            modules.append(module)
+    if not modules:
+        raise RuntimeError("未找到可捕获 Q/K 的 Llama attention 模块")
+
+    def layer_sort_key(item: Tuple[int, Any]) -> int:
+        fallback, module = item
+        layer_idx = getattr(module, "layer_idx", None)
+        return fallback if layer_idx is None else int(layer_idx)
+
+    return [module for _, module in sorted(enumerate(modules), key=layer_sort_key)]
+
+
+def compute_query_states_from_capture(capture: Dict[str, Any]) -> torch.Tensor:
+    """用目标 forward 的 attention 输入重算 RoPE 后 query states。"""
+
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    module = capture["module"]
+    hidden_states = capture["hidden_states"]
+    batch_size, query_length, _ = hidden_states.size()
+
+    query_states = module.q_proj(hidden_states)
+    key_states = module.k_proj(hidden_states)
+    value_states = module.v_proj(hidden_states)
+
+    query_states = query_states.view(batch_size, query_length, -1, module.head_dim).transpose(1, 2)
+    key_states = key_states.view(batch_size, query_length, -1, module.head_dim).transpose(1, 2)
+    value_states = value_states.view(batch_size, query_length, -1, module.head_dim).transpose(1, 2)
+
+    position_embeddings = capture.get("position_embeddings")
+    if position_embeddings is None:
+        position_ids = capture.get("position_ids")
+        cos, sin = module.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
+    query_states, _ = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    return query_states[:, :, -1, :]
+
+
+def collect_query_and_key_states(
+    captures: Dict[int, Dict[str, Any]],
+    past_key_values: Any,
+    key_length: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """从目标 query forward 捕获 query states，并从 cache 中取全部可见 key states。"""
+
+    if not captures:
+        raise RuntimeError("未捕获到 attention 输入，无法计算真实 pooling attention")
+
+    query_layers = []
+    key_layers = []
+    for layer_idx in sorted(captures):
+        capture = captures[layer_idx]
+        module = capture["module"]
+        query_states = compute_query_states_from_capture(capture)
+        key_states = cache_key_for_layer(past_key_values, layer_idx)
+        key_states = key_states[:, :, :key_length, :]
+        key_states = repeat_key_value_heads(key_states, int(module.num_key_value_groups))
+        query_layers.append(query_states[0].float().detach().cpu())
+        key_layers.append(key_states[0].float().detach().cpu())
+
+    query_array = torch.stack(query_layers, dim=0).numpy()
+    key_array = torch.stack(key_layers, dim=0).numpy()
+    return query_array.astype(np.float32), key_array.astype(np.float32)
+
+
+def register_attention_input_hooks(model) -> Tuple[Dict[int, Dict[str, Any]], List[Any]]:
+    """注册 forward pre-hook，用于捕获每层目标 query 的 attention 输入。"""
+
+    captures: Dict[int, Dict[str, Any]] = {}
+    handles = []
+
+    def capture_input(module, args, kwargs):
+        hidden_states = kwargs.get("hidden_states") if "hidden_states" in kwargs else args[0]
+        position_embeddings = kwargs.get("position_embeddings")
+        if position_embeddings is not None:
+            position_embeddings = tuple(item.detach() for item in position_embeddings)
+        layer_idx = int(getattr(module, "layer_idx", len(captures)))
+        captures[layer_idx] = {
+            "module": module,
+            "hidden_states": hidden_states.detach(),
+            "position_ids": None
+            if kwargs.get("position_ids") is None
+            else kwargs["position_ids"].detach(),
+            "position_embeddings": position_embeddings,
+        }
+
+    for module in find_llama_attention_modules(model):
+        handles.append(module.register_forward_pre_hook(capture_input, with_kwargs=True))
+    return captures, handles
+
+
+def remove_hooks(handles: Sequence[Any]) -> None:
+    """移除一组 PyTorch hook。"""
+
+    for handle in handles:
+        handle.remove()
+
+
 def replay_query_attention(
     model,
     inputs: Dict[str, torch.Tensor],
@@ -215,6 +370,27 @@ def replay_query_attention(
     dtype: str,
 ) -> np.ndarray:
     """用 KV cache replay 到指定生成 token，并捕获该 token 的完整 attention。"""
+
+    result = replay_query_attention_and_states(
+        model=model,
+        inputs=inputs,
+        generated_token_ids=generated_token_ids,
+        query_generated_index=query_generated_index,
+        dtype=dtype,
+        capture_qk=False,
+    )
+    return result["attention"]
+
+
+def replay_query_attention_and_states(
+    model,
+    inputs: Dict[str, torch.Tensor],
+    generated_token_ids: torch.Tensor,
+    query_generated_index: int,
+    dtype: str,
+    capture_qk: bool = False,
+) -> Dict[str, Any]:
+    """replay 到指定生成 token，并可额外捕获真实 pooling 所需 Q/K states。"""
 
     if query_generated_index < 0:
         raise ValueError("--query-generated-index 必须大于或等于 0")
@@ -237,6 +413,8 @@ def replay_query_attention(
 
         attention_mask = inputs.get("attention_mask")
         query_attention = None
+        query_states = None
+        key_states = None
         for generated_index, token_id in enumerate(generated_token_ids[: query_generated_index + 1].tolist()):
             current_token = torch.tensor([[int(token_id)]], device=get_input_device(model), dtype=torch.long)
             if attention_mask is not None:
@@ -247,28 +425,49 @@ def replay_query_attention(
                 )
                 attention_mask = torch.cat([attention_mask, next_mask], dim=1)
 
-            outputs = model(
-                input_ids=current_token,
-                attention_mask=attention_mask,
-                position_ids=torch.tensor(
-                    [[inputs["input_ids"].shape[1] + generated_index]],
-                    device=get_input_device(model),
-                    dtype=torch.long,
+            captures: Dict[int, Dict[str, Any]] = {}
+            handles: List[Any] = []
+            if capture_qk and generated_index == query_generated_index:
+                captures, handles = register_attention_input_hooks(model)
+            try:
+                outputs = model(
+                    input_ids=current_token,
+                    attention_mask=attention_mask,
+                    position_ids=torch.tensor(
+                        [[inputs["input_ids"].shape[1] + generated_index]],
+                        device=get_input_device(model),
+                        dtype=torch.long,
+                    )
+                    if "position_ids" in inputs
+                    else None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_attentions=generated_index == query_generated_index,
+                    return_dict=True,
                 )
-                if "position_ids" in inputs
-                else None,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_attentions=generated_index == query_generated_index,
-                return_dict=True,
-            )
+            finally:
+                if handles:
+                    remove_hooks(handles)
             if generated_index == query_generated_index:
                 query_attention = stack_step_attentions(outputs.attentions, dtype=dtype)
+                if capture_qk:
+                    key_length = int(query_attention.shape[-1])
+                    query_states, key_states = collect_query_and_key_states(
+                        captures=captures,
+                        past_key_values=outputs.past_key_values,
+                        key_length=key_length,
+                    )
             past_key_values = outputs.past_key_values
 
     if query_attention is None:
         raise RuntimeError("未捕获到 query attention")
-    return query_attention
+    result: Dict[str, Any] = {"attention": query_attention}
+    if capture_qk:
+        if query_states is None or key_states is None:
+            raise RuntimeError("未捕获到真实 pooling 所需的 Q/K states")
+        result["query_states"] = query_states
+        result["key_states"] = key_states
+    return result
 
 
 def build_prompt_blocks(token_count: int, block_size: int) -> List[Dict[str, int]]:
@@ -488,6 +687,116 @@ def build_pooling_attention_csv_rows(
     return rows
 
 
+def validate_true_pooling_shapes(
+    dense_attention: np.ndarray,
+    query_states: np.ndarray,
+    key_states: np.ndarray,
+) -> None:
+    """校验真实 pooling attention 的 Q/K/dense attention 形状。"""
+
+    if dense_attention.ndim != 3:
+        raise ValueError(f"dense_attention 必须是 [layer, head, key_position]，实际为 {dense_attention.shape}")
+    if query_states.ndim != 3:
+        raise ValueError(f"query_states 必须是 [layer, head, head_dim]，实际为 {query_states.shape}")
+    if key_states.ndim != 4:
+        raise ValueError(f"key_states 必须是 [layer, head, key_position, head_dim]，实际为 {key_states.shape}")
+    if dense_attention.shape[:2] != query_states.shape[:2]:
+        raise ValueError("dense_attention 和 query_states 的 layer/head 维度不一致")
+    if dense_attention.shape != key_states.shape[:3]:
+        raise ValueError("dense_attention 和 key_states 的 layer/head/key_position 维度不一致")
+    if query_states.shape[2] != key_states.shape[3]:
+        raise ValueError("query_states 和 key_states 的 head_dim 不一致")
+
+
+def build_true_pooling_attention_csv_rows(
+    dense_attention: np.ndarray,
+    query_states: np.ndarray,
+    key_states: np.ndarray,
+    block_size: int,
+    query_generated_index: int,
+) -> List[Dict[str, Any]]:
+    """按真实 QK pooling 重新计算 block attention，并输出 7 列 CSV 行。"""
+
+    if block_size <= 0:
+        raise ValueError("block_size 必须大于 0")
+    validate_true_pooling_shapes(dense_attention, query_states, key_states)
+
+    dense_attention = dense_attention.astype(np.float64, copy=False)
+    query_states = query_states.astype(np.float64, copy=False)
+    key_states = key_states.astype(np.float64, copy=False)
+    key_length = dense_attention.shape[-1]
+    blocks = build_prompt_blocks(key_length, block_size)
+    head_dim = int(query_states.shape[-1])
+    rows: List[Dict[str, Any]] = []
+
+    for layer in range(dense_attention.shape[0]):
+        for head in range(dense_attention.shape[1]):
+            avg_logits = []
+            max_logits = []
+            for block in blocks:
+                start = block["start_position"]
+                end_exclusive = block["end_position"] + 1
+                block_keys = key_states[layer, head, start:end_exclusive, :]
+                avg_key = block_keys.mean(axis=0)
+                max_key = block_keys.max(axis=0)
+                avg_logits.append(float(np.dot(query_states[layer, head], avg_key) / math.sqrt(head_dim)))
+                max_logits.append(float(np.dot(query_states[layer, head], max_key) / math.sqrt(head_dim)))
+
+            avg_attention = stable_softmax(np.array(avg_logits, dtype=np.float64))
+            max_attention = stable_softmax(np.array(max_logits, dtype=np.float64))
+
+            for block_index, block in enumerate(blocks):
+                start = block["start_position"]
+                end_exclusive = block["end_position"] + 1
+                rows.append(
+                    {
+                        "query_generated_index": int(query_generated_index),
+                        "token_range": f"{start + 1}-{block['end_position'] + 1}",
+                        "dense_attention_sum": compact_float(
+                            dense_attention[layer, head, start:end_exclusive].sum()
+                        ),
+                        "avg_pooling_attention": compact_float(avg_attention[block_index]),
+                        "max_pooling_attention": compact_float(max_attention[block_index]),
+                        "layer": int(layer),
+                        "head": int(head),
+                    }
+                )
+
+    return rows
+
+
+def summarize_true_pooling_attention_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """统计真实 pooling CSV 各 attention 列在 query/layer/head 下的归一化误差。"""
+
+    grouped: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+    for row in rows:
+        key = (int(row["query_generated_index"]), int(row["layer"]), int(row["head"]))
+        values = grouped.setdefault(
+            key,
+            {
+                "dense_attention_sum": 0.0,
+                "avg_pooling_attention": 0.0,
+                "max_pooling_attention": 0.0,
+            },
+        )
+        values["dense_attention_sum"] += float(row["dense_attention_sum"])
+        values["avg_pooling_attention"] += float(row["avg_pooling_attention"])
+        values["max_pooling_attention"] += float(row["max_pooling_attention"])
+
+    def max_error(column: str) -> float:
+        if not grouped:
+            return 0.0
+        return max(abs(values[column] - 1.0) for values in grouped.values())
+
+    return {
+        "row_count": int(len(rows)),
+        "group_count": int(len(grouped)),
+        "dense_attention_sum_max_error": float(max_error("dense_attention_sum")),
+        "avg_pooling_attention_sum_max_error": float(max_error("avg_pooling_attention")),
+        "max_pooling_attention_sum_max_error": float(max_error("max_pooling_attention")),
+    }
+
+
 def format_top_block_table(rows: Sequence[Dict[str, Any]], selected_key: str, rank_key: str) -> List[str]:
     """把选中的 top block 格式化成 Markdown 表格。"""
 
@@ -557,6 +866,7 @@ def write_outputs(
     comparison: Dict[str, List[Dict[str, Any]]],
     attention: np.ndarray,
     tokens: Sequence[Dict[str, Any]] | None = None,
+    true_pooling_rows: Sequence[Dict[str, Any]] | None = None,
 ) -> None:
     """写出 metadata、pooling 分数、细粒度分数、完整 attention 和摘要文件。"""
 
@@ -579,6 +889,9 @@ def write_outputs(
         metadata=metadata,
     )
     write_csv(output_dir / "pooling_attention_comparison.csv", csv_rows, POOLING_ATTENTION_CSV_FIELDS)
+    if true_pooling_rows is not None:
+        true_pooling_file = output_dir / f"true_pooling_attention_7col_block{int(metadata['block_size'])}.csv"
+        write_csv(true_pooling_file, true_pooling_rows, TRUE_POOLING_ATTENTION_CSV_FIELDS)
     np.savez_compressed(output_dir / "attention_detail.npz", attention=attention)
     write_summary_markdown(output_dir / "summary.md", metadata, comparison)
 
@@ -667,13 +980,15 @@ def run_compare(args: argparse.Namespace) -> None:
         source="generated",
         start_position=len(prompt_token_ids),
     )
-    attention = replay_query_attention(
+    replay_result = replay_query_attention_and_states(
         model=model,
         inputs=inputs,
         generated_token_ids=generated_token_ids,
         query_generated_index=args.query_generated_index,
         dtype=args.dtype,
+        capture_qk=args.true_pooling_attention,
     )
+    attention = replay_result["attention"]
     comparison = build_pooling_comparison(
         attention=attention,
         prompt_tokens=prompt_tokens,
@@ -690,12 +1005,36 @@ def run_compare(args: argparse.Namespace) -> None:
         generated_text=generated_text,
         attention_mask_ablation=attention_mask_ablation,
     )
+    metadata["key_token_count"] = int(attention.shape[-1])
+    true_pooling_rows = None
+    if args.true_pooling_attention:
+        true_pooling_rows = build_true_pooling_attention_csv_rows(
+            dense_attention=attention,
+            query_states=replay_result["query_states"],
+            key_states=replay_result["key_states"],
+            block_size=args.block_size,
+            query_generated_index=args.query_generated_index,
+        )
+        true_pooling_summary = summarize_true_pooling_attention_rows(true_pooling_rows)
+        metadata["true_pooling_attention_csv"] = (
+            f"true_pooling_attention_7col_block{int(args.block_size)}.csv"
+        )
+        metadata["true_pooling_attention_csv_fields"] = TRUE_POOLING_ATTENTION_CSV_FIELDS
+        metadata["true_pooling_attention_csv_semantics"] = (
+            "按 query_generated_index/layer/head 展开；token_range 覆盖当前 query 可见的全部 key tokens，"
+            "即 prompt tokens 加已生成到当前 query 的 generated tokens。dense_attention_sum 是原始 dense "
+            "attention 在该 block 内的和；avg_pooling_attention 是 block 内 K 向量平均后重新 QK softmax "
+            "得到的 block attention；max_pooling_attention 是 block 内 K 向量逐维 max 后重新 QK softmax "
+            "得到的 block attention。"
+        )
+        metadata["true_pooling_attention_summary"] = true_pooling_summary
     write_outputs(
         output_dir=args.output_dir,
         metadata=metadata,
         comparison=comparison,
         attention=attention,
         tokens=[*prompt_tokens, *generated_tokens],
+        true_pooling_rows=true_pooling_rows,
     )
     print(f"Pooling attention 对照结果已保存到 {args.output_dir}", flush=True)
 
@@ -724,6 +1063,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--mask-bos-token",
         action="store_true",
         help="保留 BOS token，但将其 attention_mask 置 0，用于测试遮住 <|begin_of_text|> 的影响。",
+    )
+    parser.add_argument(
+        "--true-pooling-attention",
+        action="store_true",
+        help="额外用目标 query 的 Q/K states 对全部可见 key tokens 做真实 avg-key/max-key pooling attention。",
     )
     parser.add_argument("--overwrite", action="store_true", help="覆盖非空输出目录。")
     return parser

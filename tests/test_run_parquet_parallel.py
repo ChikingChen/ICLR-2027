@@ -109,6 +109,7 @@ class RunParquetParallelTest(unittest.TestCase):
                 "--log-prefill-decode-timing",
                 "--profile-attention-kernels",
                 "--mask-bos-token",
+                "--log-attn-implementation",
             ]
         )
         config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
@@ -125,6 +126,7 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertIn("--profile_attention_kernels", command)
         self.assertIn("--attention_profile_sample_offset", command)
         self.assertIn("--mask_bos_token", command)
+        self.assertIn("--log_attn_implementation", command)
         self.assertIn("--batch_size", command)
         self.assertEqual(command[command.index("--batch_size") + 1], "1")
         self.assertTrue(config.log_generation_ppl)
@@ -132,10 +134,20 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertTrue(config.log_prefill_decode_timing)
         self.assertTrue(config.profile_attention_kernels)
         self.assertTrue(config.mask_bos_token)
+        self.assertTrue(config.log_attn_implementation)
         self.assertEqual(module.prediction_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/pred/niah_single_1.jsonl"))
         self.assertEqual(module.log_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/logs/niah_single_1.log"))
         self.assertIn("/data/parquet/synthetic/4096/data", command)
         self.assertIn("/data/local_eval/llama/synthetic/4096/pred", command)
+
+    def test_attn_implementation_line_is_replayed_to_runner_output(self):
+        module = _load_module()
+
+        self.assertTrue(
+            module.is_batch_progress_line(
+                "[ATTN_IMPLEMENTATION] model.config._attn_implementation=flash_attention_2"
+            )
+        )
 
     def test_build_config_rejects_non_singleton_batch_size(self):
         module = _load_module()
@@ -156,6 +168,28 @@ class RunParquetParallelTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "batch-size.*1"):
             module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
+
+    def test_attention_profile_sample_offset_is_accepted_for_compatibility(self):
+        module = _load_module()
+        args = module.build_parser().parse_args(
+            [
+                "--model",
+                "llama=/models/llama",
+                "--seq-lengths",
+                "4096",
+                "--tasks",
+                "niah_single_1",
+                "--gpus",
+                "0",
+                "--profile-attention-kernels",
+                "--attention-profile-sample-offset",
+                "3",
+            ]
+        )
+
+        config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
+
+        self.assertEqual(config.attention_profile_sample_offset, 3)
 
     def test_model_python_overrides_command_python_for_matching_model(self):
         module = _load_module()

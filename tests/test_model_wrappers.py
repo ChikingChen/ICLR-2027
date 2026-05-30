@@ -133,6 +133,45 @@ class ModelWrappersTest(unittest.TestCase):
         self.assertEqual(summary["generated_token_count"], 3)
         self.assertAlmostEqual(summary["decode_forward_ms_per_token_avg"], 2.0)
 
+    def test_attention_timing_collector_summarizes_prefill_and_decode(self):
+        module = _load_module()
+
+        collector = module.AttentionTimingCollector()
+        collector.record(
+            "prefill",
+            {
+                "timer_backend": "cuda_event_attention_ops",
+                "attention_kernel_ms": 3.0,
+                "attention_kernel_event_count": 2,
+            },
+        )
+        collector.record(
+            "decode",
+            {
+                "timer_backend": "cuda_event_attention_ops",
+                "attention_kernel_ms": 1.0,
+                "attention_kernel_event_count": 1,
+            },
+        )
+        collector.record(
+            "decode",
+            {
+                "timer_backend": "cuda_event_attention_ops",
+                "attention_kernel_ms": 2.0,
+                "attention_kernel_event_count": 1,
+            },
+        )
+
+        summary = collector.summary(generated_token_count=3, input_tokens=128)
+
+        self.assertEqual(summary["timer_backend"], "cuda_event_attention_ops")
+        self.assertEqual(summary["input_tokens"], 128)
+        self.assertEqual(summary["generated_token_count"], 3)
+        self.assertAlmostEqual(summary["prefill_attention_kernel_ms"], 3.0)
+        self.assertAlmostEqual(summary["decode_attention_kernel_ms_total"], 3.0)
+        self.assertAlmostEqual(summary["decode_attention_kernel_ms_per_token_avg"], 1.0)
+        self.assertEqual(summary["attention_kernel_event_count"], 4)
+
     def test_mask_bos_inputs_for_generation_zeroes_bos_and_preserves_positions(self):
         module = _load_module()
 
@@ -185,6 +224,58 @@ class ModelWrappersTest(unittest.TestCase):
 
         self.assertNotIn("position_ids", generate_inputs)
         self.assertIn("position_ids", inputs)
+
+    def test_attention_profile_generation_kwargs_drop_score_retention(self):
+        module = _load_module()
+        wrapper = object.__new__(module.HuggingFaceModel)
+        wrapper.generation_kwargs = {
+            "max_new_tokens": 8,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+            "output_attentions": True,
+        }
+
+        profile_kwargs = wrapper._generation_kwargs_for_attention_profile()
+
+        self.assertEqual(profile_kwargs["max_new_tokens"], 8)
+        self.assertEqual(profile_kwargs["num_logits_to_keep"], 1)
+        self.assertNotIn("return_dict_in_generate", profile_kwargs)
+        self.assertNotIn("output_scores", profile_kwargs)
+        self.assertNotIn("output_attentions", profile_kwargs)
+
+    def test_generate_for_attention_profile_retries_without_num_logits_to_keep(self):
+        module = _load_module()
+        wrapper = object.__new__(module.HuggingFaceModel)
+        wrapper.mask_bos_token = False
+        wrapper.generation_kwargs = {
+            "max_new_tokens": 1,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+        }
+
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, **kwargs):
+                self.calls.append(kwargs)
+                if "num_logits_to_keep" in kwargs:
+                    raise ValueError("unused model_kwargs: ['num_logits_to_keep']")
+                return torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+        fake_model = FakeModel()
+        wrapper.model = fake_model
+
+        output = wrapper._generate_for_attention_profile(
+            {"input_ids": torch.tensor([[1, 2]], dtype=torch.long)}
+        )
+
+        self.assertEqual(output.tolist(), [[1, 2, 3]])
+        self.assertEqual(len(fake_model.calls), 2)
+        self.assertIn("num_logits_to_keep", fake_model.calls[0])
+        self.assertNotIn("num_logits_to_keep", fake_model.calls[1])
+        self.assertNotIn("output_scores", fake_model.calls[0])
+        self.assertNotIn("return_dict_in_generate", fake_model.calls[0])
 
     def test_masked_bos_prepare_uses_cache_position_for_position_ids(self):
         module = _load_module()
@@ -250,6 +341,44 @@ class ModelWrappersTest(unittest.TestCase):
         self.assertEqual(summary["attention_kernel_event_count"], 0)
         self.assertIsNone(summary["attention_kernel_ms"])
         self.assertIn("warning", summary)
+
+    def test_cuda_event_attention_timer_records_wrapped_global_call(self):
+        module = _load_module()
+
+        def fake_attention_op(x):
+            return x + 1
+
+        namespace = {"fake_attention_op": fake_attention_op}
+        timer = module.CudaEventAttentionTimer()
+
+        with timer:
+            timer.patch_function(namespace, "fake_attention_op", "fake_attention_op")
+            output = namespace["fake_attention_op"](torch.tensor([1.0]))
+
+        summary = timer.summary()
+        self.assertEqual(output.tolist(), [2.0])
+        self.assertEqual(summary["attention_kernel_event_count"], 1)
+        self.assertIsNotNone(summary["attention_kernel_ms"])
+        self.assertGreaterEqual(summary["attention_kernel_ms"], 0.0)
+        self.assertIn(
+            summary["timer_backend"],
+            {"cuda_event_attention_ops", "perf_counter_attention_ops"},
+        )
+
+    def test_cuda_event_attention_timer_restores_wrapped_global_call(self):
+        module = _load_module()
+
+        def fake_attention_op(x):
+            return x + 1
+
+        namespace = {"fake_attention_op": fake_attention_op}
+        timer = module.CudaEventAttentionTimer()
+
+        with timer:
+            self.assertTrue(timer.patch_function(namespace, "fake_attention_op", "fake_attention_op"))
+            self.assertIsNot(namespace["fake_attention_op"], fake_attention_op)
+
+        self.assertIs(namespace["fake_attention_op"], fake_attention_op)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,133 @@
 # CODEX 变更说明
 
+## 2026-05-30 新增真实 QK pooling attention 输出
+
+### 变更文件
+
+- `tools/compare_pooling_attention.py`
+- `tests/test_pooling_attention_compare.py`
+- `CODEX_CHANGES.md`
+
+### 变更目的
+
+按用户重新定义的 pooling 口径，`tools/compare_pooling_attention.py` 新增 `--true-pooling-attention`。开启后，脚本会在指定 `query_generated_index` 的 replay forward 中捕获 Llama 每层每 head 的 query states，并从 KV cache 中读取当前 query 可见的全部 key states。
+
+真实 pooling CSV 覆盖 `prompt tokens + generated tokens[0:query_generated_index]` 的全部 key token；按 `--block-size` 切块后，分别用 avg-key 和 max-key 生成 block key，并重新计算 `QK / sqrt(d)` 和 block 级 softmax。新增输出文件名为 `true_pooling_attention_7col_block<block_size>.csv`，列为 `query_generated_index`、`token_range`、`dense_attention_sum`、`avg_pooling_attention`、`max_pooling_attention`、`layer` 和 `head`。
+
+`metadata.json` 现在会在开启该参数时记录真实 pooling CSV 文件名、字段、语义说明、`key_token_count` 和各 attention 列按 `query_generated_index/layer/head` 聚合后的归一化误差。
+
+### 验证方式
+
+已按 TDD 先写红测，确认新参数、新 true pooling 行构造函数、归一化摘要和输出文件均缺失后再实现。最终验证：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 conda run --no-capture-output -n model python -m unittest tests.test_pooling_attention_compare tests.test_attention_dump_tools
+PYTHONDONTWRITEBYTECODE=1 conda run --no-capture-output -n model python -m py_compile tools/compare_pooling_attention.py tests/test_pooling_attention_compare.py
+```
+
+当前 `torch.cuda.is_available()` 为 `False`，且 `nvidia-smi` 无法连接 NVIDIA driver，因此没有启动 4k Llama 实际 replay；待 GPU 恢复后可用 `--true-pooling-attention --block-size 32 --query-generated-index 0` 生成真实 4k CSV。
+
+## 2026-05-30 生成 32-token pooling attention 六列表
+
+### 变更文件
+
+- `attention_dumps/pooling_token_compare/llama_niah_single_1_4k_sample0_block32/pooling_attention_6col_block32.csv`
+- `CODEX_CHANGES.md`
+
+### 变更目的
+
+按用户要求，从现有 `pooling_attention_comparison.csv` 中抽取一个不需要重跑模型的简化 CSV。新文件按 32 个 token 一个 block、逐层逐 head 展开，保留六列：`token_range`、`dense_attention_sum`、`avg_pooling_attention`、`max_pooling_attention`、`layer` 和 `head`。
+
+### 验证方式
+
+已检查新文件表头和前 4 行，并确认新文件与原始逐层逐 head 明细行数一致，均为 118785 行（含表头）。
+
+## 2026-05-30 改为全样本 attention CUDA event timing
+
+### 变更文件
+
+- `AGENTS.md`
+- `RULER/scripts/pred/model_wrappers.py`
+- `RULER/scripts/pred/call_api.py`
+- `RULER/scripts/run_parquet_parallel.py`
+- `RULER/scripts/eval/collect_results.py`
+- `tests/test_model_wrappers.py`
+- `tests/test_call_api_progress.py`
+- `tests/test_collect_results.py`
+- `tests/test_run_parquet_parallel.py`
+
+### 变更目的
+
+按用户要求，`--profile_attention_kernels` 不再只抽样输入 jsonl 第 0 行。Hugging Face wrapper 现在会在正式 `generate()` forward 路径中用 CUDA event 包装 attention op，并为每条实际预测样本写出一条 `record_type=attention_profile` 的 timing sidecar 记录。
+
+`RULER/scripts/pred/call_api.py` 删除了循环前额外 profile 第 0 条样本的逻辑，改为把每条预测返回的 `attention_profile` 与该样本的 `sample_line_no`、`sample_index` 一起写入 `<任务>.generation_timing.jsonl`。`--attention_profile_sample_offset` / `--attention-profile-sample-offset` 保留为兼容旧命令的参数，但当前不再用于抽样，也不再限制为 0。
+
+`RULER/scripts/eval/collect_results.py` 现在会聚合全部 `attention_profile` 记录：detail 行新增 `attention_profile_records`、`prefill_attention_kernel_ms_total` 和 `attention_profile_generated_token_count_total`；summary 表新增 `attention_profile_records`，并用全部样本记录加权计算 `avg_prefill_attention_kernel_ms` 和 `avg_decode_attention_kernel_ms_per_token`。
+
+### 验证方式
+
+已先写红测确认旧逻辑仍然只取第 0 条/第一条 profile，然后实现全样本 timing 与聚合。最终验证命令：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 conda run --no-capture-output -n model python -m unittest tests.test_model_wrappers tests.test_call_api_progress tests.test_collect_results tests.test_run_parquet_parallel
+```
+
+## 2026-05-30 将 attention profiler 替换为 CUDA event 计时
+
+### 变更文件
+
+- `RULER/scripts/pred/model_wrappers.py`
+- `RULER/scripts/pred/call_api.py`
+- `tests/test_model_wrappers.py`
+- `tests/test_call_api_progress.py`
+- `tests/test_collect_results.py`
+
+### 变更目的
+
+按用户要求降低 RULER `--profile_attention_kernels` 的额外显存压力：Hugging Face wrapper 不再使用 `torch.profiler.profile()` 采集 attention kernel 事件，改为临时包装模型中常见的 attention 调用点，并用 CUDA event 记录 attention op 的 GPU 耗时。当前覆盖 `scaled_dot_product_attention`、Transformers Llama/Qwen FlashAttention helper `_flash_attention_forward`，以及 GLM 自定义代码中常见的 `flash_attn_func` 和 `flash_attn_varlen_func`。
+
+输出 sidecar 字段保持兼容，`prefill_attention_kernel_ms`、`decode_attention_kernel_ms_total`、`decode_attention_kernel_ms_per_token_avg` 和 `attention_kernel_event_count` 继续写入 `<任务>.generation_timing.jsonl`；`timer_backend` 从 `torch_profiler` 更新为 `cuda_event_attention_ops`。profile 额外生成样本时会关闭 `output_scores`、`return_dict_in_generate` 等分数/attention 保留项，并在模型支持时使用 `num_logits_to_keep=1`，避免为了第 0 条 profile 样本额外保存完整 logits 或 generation scores。
+
+`call_api.py` 的 profile 异常兜底也同步改为 `cuda_event_attention_ops`，并在 profile 失败后尝试 `torch.cuda.empty_cache()`，避免 profile OOM 后继续污染正式预测阶段。
+
+### 验证方式
+
+已用 `unittest` 验证 CUDA event attention timer 的包装/恢复、profile 生成参数瘦身、sidecar 记录构造和汇总兼容：
+
+```bash
+conda run --no-capture-output -n model python -m unittest tests.test_model_wrappers
+conda run --no-capture-output -n model python -m unittest tests.test_call_api_progress tests.test_collect_results
+```
+
+## 2026-05-30 新增 Llama 64k attention implementation smoke 实验
+
+### 变更文件
+
+- `RULER/scripts/pred/call_api.py`
+- `RULER/scripts/pred/model_wrappers.py`
+- `RULER/scripts/run_parquet_parallel.py`
+- `tests/test_call_api_progress.py`
+- `tests/test_run_parquet_parallel.py`
+- `scratch/llama_64k_attn_impl_smoke/parquet_data/synthetic/65536/data/niah_single_1/validation.jsonl`
+- `scratch/llama_64k_attn_impl_smoke/parquet_data/conversion_report.json`
+
+### 变更目的
+
+按用户要求为 Llama 64k RULER 小任务实验增加 attention 实现确认能力。`call_api.py` 新增 `--log_attn_implementation`，`run_parquet_parallel.py` 新增 `--log-attn-implementation` 并透传给 Hugging Face 子进程；模型加载完成后会输出 `[ATTN_IMPLEMENTATION] model.config._attn_implementation=<值>`。runner 会把该行写入任务日志并同步回显到终端，便于确认实际运行是否为 `flash_attention_2`。
+
+同时生成独立 smoke 输入目录 `scratch/llama_64k_attn_impl_smoke/`，只包含 `niah_single_1` 的 64k 前 3 条样本，不覆盖原始全量 RULER 输入。
+
+### 验证方式
+
+已用 `unittest` 验证新参数解析、HF 后端校验、runner 透传和 `[ATTN_IMPLEMENTATION]` 回显规则：
+
+```bash
+conda run --no-capture-output -n model python -m unittest tests.test_call_api_progress tests.test_run_parquet_parallel
+conda run --no-capture-output -n model python -m unittest tests.test_model_wrappers
+```
+
+已执行 runner dry-run，确认命令包含 `--log_attn_implementation` 且输出路径指向 `scratch/llama_64k_attn_impl_smoke/local_eval/`。当前 `torch.cuda.is_available()` 为 `False`，`nvidia-smi` 仍无法连接 NVIDIA driver，因此未启动正式 64k 推理。
+
 ## 2026-05-30 移动 FlashAttention baseline 实验数据
 
 ### 变更文件

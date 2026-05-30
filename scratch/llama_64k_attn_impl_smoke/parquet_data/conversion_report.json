@@ -1,0 +1,20 @@
+{
+  "parquet_data_dir": "/data/czy/ICLR-2027/benchmark/RULER-llama3-1M",
+  "save_dir": "experiment_data/llama_64k_attn_impl_smoke/parquet_data/synthetic",
+  "subset": "validation",
+  "converted": [
+    {
+      "task": "niah_single_1",
+      "length_suffix": "64k",
+      "length": 65536,
+      "status": "converted",
+      "parquet_files": [
+        "/data/czy/ICLR-2027/benchmark/RULER-llama3-1M/niah_single_1_64k/validation-00000-of-00001.parquet"
+      ],
+      "output_file": "experiment_data/llama_64k_attn_impl_smoke/parquet_data/synthetic/65536/data/niah_single_1/validation.jsonl",
+      "written": 3
+    }
+  ],
+  "failed": [],
+  "ignored": []
+}

@@ -99,16 +99,30 @@ class CollectResultsTest(unittest.TestCase):
                 {
                     "record_type": "attention_profile",
                     "task": "niah_single_1",
-                    "profile_sample_policy": "first_input_record",
+                    "profile_sample_policy": "all_input_records",
                     "sample_line_no": 0,
                     "sample_index": 0,
-                    "timer_backend": "torch_profiler",
+                    "timer_backend": "cuda_event_attention_ops",
                     "input_tokens": 128,
                     "generated_token_count": 2,
                     "prefill_attention_kernel_ms": 3.0,
                     "decode_attention_kernel_ms_total": 1.5,
                     "decode_attention_kernel_ms_per_token_avg": 0.75,
                     "attention_kernel_event_count": 6,
+                },
+                {
+                    "record_type": "attention_profile",
+                    "task": "niah_single_1",
+                    "profile_sample_policy": "all_input_records",
+                    "sample_line_no": 1,
+                    "sample_index": 1,
+                    "timer_backend": "cuda_event_attention_ops",
+                    "input_tokens": 130,
+                    "generated_token_count": 3,
+                    "prefill_attention_kernel_ms": 9.0,
+                    "decode_attention_kernel_ms_total": 7.5,
+                    "decode_attention_kernel_ms_per_token_avg": 2.5,
+                    "attention_kernel_event_count": 4,
                 },
             ],
         )
@@ -323,21 +337,25 @@ class CollectResultsTest(unittest.TestCase):
             self.assertEqual(detail_row["sample_timing_records"], 2)
             self.assertEqual(detail_row["attention_profile_sample_line_no"], 0)
             self.assertEqual(detail_row["attention_profile_sample_index"], 0)
+            self.assertEqual(detail_row["attention_profile_records"], 2)
+            self.assertAlmostEqual(detail_row["prefill_attention_kernel_ms_total"], 12.0)
+            self.assertAlmostEqual(detail_row["attention_profile_generated_token_count_total"], 5.0)
             self.assertAlmostEqual(detail_row["prefill_forward_ms_total"], 30.0)
             self.assertAlmostEqual(detail_row["decode_forward_ms_total"], 10.0)
             self.assertAlmostEqual(detail_row["decode_forward_ms_per_token_avg"], 2.0)
-            self.assertAlmostEqual(detail_row["prefill_attention_kernel_ms"], 3.0)
-            self.assertAlmostEqual(detail_row["decode_attention_kernel_ms_total"], 1.5)
-            self.assertAlmostEqual(detail_row["decode_attention_kernel_ms_per_token_avg"], 0.75)
-            self.assertEqual(detail_row["attention_kernel_event_count"], 6)
+            self.assertAlmostEqual(detail_row["prefill_attention_kernel_ms"], 6.0)
+            self.assertAlmostEqual(detail_row["decode_attention_kernel_ms_total"], 9.0)
+            self.assertAlmostEqual(detail_row["decode_attention_kernel_ms_per_token_avg"], 1.8)
+            self.assertEqual(detail_row["attention_kernel_event_count"], 10)
 
             summary_row = workbook["summary_by_model"][0]
             self.assertAlmostEqual(summary_row["total_prefill_forward_ms"], 30.0)
             self.assertAlmostEqual(summary_row["total_decode_forward_ms"], 10.0)
             self.assertAlmostEqual(summary_row["avg_decode_forward_ms_per_token"], 2.0)
             self.assertEqual(summary_row["attention_profiled_tasks"], 1)
-            self.assertAlmostEqual(summary_row["avg_prefill_attention_kernel_ms"], 3.0)
-            self.assertAlmostEqual(summary_row["avg_decode_attention_kernel_ms_per_token"], 0.75)
+            self.assertEqual(summary_row["attention_profile_records"], 2)
+            self.assertAlmostEqual(summary_row["avg_prefill_attention_kernel_ms"], 6.0)
+            self.assertAlmostEqual(summary_row["avg_decode_attention_kernel_ms_per_token"], 1.8)
 
 
 if __name__ == "__main__":

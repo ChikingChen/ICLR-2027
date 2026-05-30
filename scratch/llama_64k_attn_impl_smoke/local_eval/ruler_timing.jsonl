@@ -1,0 +1,1 @@
+{"model": "Llama-3.1-8B-attn-impl-smoke", "length": 65536, "task": "niah_single_1", "gpu": 0, "started_at": 1780128928.6522295, "ended_at": 1780129110.807371, "elapsed_seconds": 182.15514135360718, "pred_lines": 3, "total_samples": 3, "exit_code": 0}

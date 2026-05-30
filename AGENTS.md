@@ -125,12 +125,12 @@
 - `RULER/scripts/pred/call_api.py`
   - RULER 原生预测入口。
   - 读取 `--data_dir/<task>/<subset>.jsonl`，加载指定模型或服务客户端，写出带 `pred` 字段的预测 jsonl。
-  - 本地增加了 `--log_batch_progress`、`--max_retries`、`--log_generation_ppl`、`--log_generation_token_ppl`、`--log_prefill_decode_timing` 和 `--profile_attention_kernels`，用于观察进度、避免单个样本无限重试，并在 Hugging Face 生成阶段记录 PPL、prefill/decode 耗时和第 0 行样本的 attention kernel profiler。
+  - 本地增加了 `--log_batch_progress`、`--max_retries`、`--log_generation_ppl`、`--log_generation_token_ppl`、`--log_prefill_decode_timing` 和 `--profile_attention_kernels`，用于观察进度、避免单个样本无限重试，并在 Hugging Face 生成阶段记录 PPL、prefill/decode 耗时和每条样本的 attention CUDA event 耗时。
 - `RULER/scripts/pred/model_wrappers.py`
   - Hugging Face、本地模型和 Mamba wrapper。
   - 本地包含 GLM 配置兼容逻辑。
   - 本地 Hugging Face wrapper 支持基于 `generate(..., output_scores=True)` 的生成答案 token PPL 统计，并可额外返回每个生成 token 的 logprob、NLL 和 PPL 明细。
-  - 本地 Hugging Face wrapper 可用 CUDA event 记录每条样本的 prefill/decode forward 耗时；也可用 `torch.profiler` 对每个任务第 0 行样本统计严格 attention CUDA kernel 时间。
+  - 本地 Hugging Face wrapper 可用 CUDA event 记录每条样本的 prefill/decode forward 耗时；也可在正式 `generate()` forward 内用 CUDA event 记录每条样本的 attention op 耗时。
 - `RULER/scripts/eval/evaluate.py`
   - RULER 原生评分入口。
   - 读取预测 jsonl，按 `RULER/scripts/eval/synthetic/constants.py` 中的 metric 计算每个任务分数。
@@ -174,7 +174,7 @@
 
 如果开启 `--log_generation_token_ppl`，`RULER/scripts/pred/call_api.py` 会额外写出 sidecar 文件 `<任务>.generation_tokens.jsonl`。每行对应一个样本，包含 `index`、`task`、`generation_token_count` 和 `tokens`；`tokens` 中每个元素记录生成 token 的 `position`、`token_id`、`token`、`logprob`、`nll` 和 `ppl`。该 token 级 PPL 仍然是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
 
-如果开启 `--log_prefill_decode_timing` 或 `--profile_attention_kernels`，`RULER/scripts/pred/call_api.py` 会额外写出 sidecar 文件 `<任务>.generation_timing.jsonl`。其中 `record_type=sample_timing` 每条样本一行，记录 `sample_line_no`、`sample_index`、`prefill_forward_ms`、`decode_forward_ms_total`、`decode_forward_ms_per_token_avg` 和 `generated_token_count`；`record_type=attention_profile` 每个任务最多一行，固定采输入 jsonl 第 0 行，记录 `sample_line_no=0`、原始 `sample_index`、`prefill_attention_kernel_ms`、`decode_attention_kernel_ms_total`、`decode_attention_kernel_ms_per_token_avg` 和 `attention_kernel_event_count`。`prefill/decode forward` 耗时是完整 forward 阶段耗时；`attention_kernel` 字段才是 profiler 按 kernel 名称过滤后的严格 GPU attention 时间。
+如果开启 `--log_prefill_decode_timing` 或 `--profile_attention_kernels`，`RULER/scripts/pred/call_api.py` 会额外写出 sidecar 文件 `<任务>.generation_timing.jsonl`。其中 `record_type=sample_timing` 每条样本一行，记录 `sample_line_no`、`sample_index`、`prefill_forward_ms`、`decode_forward_ms_total`、`decode_forward_ms_per_token_avg` 和 `generated_token_count`；`record_type=attention_profile` 也会对每条实际预测样本写一行，记录 `sample_line_no`、原始 `sample_index`、`prefill_attention_kernel_ms`、`decode_attention_kernel_ms_total`、`decode_attention_kernel_ms_per_token_avg` 和 `attention_kernel_event_count`。`prefill/decode forward` 耗时是完整 forward 阶段耗时；`attention_kernel` 字段是用 CUDA event 包装 attention op 得到的 GPU attention 时间。
 
 评分时，`RULER/scripts/eval/evaluate.py` 会比较 `pred` 和 `outputs`，并统计空预测数量。
 
@@ -284,8 +284,8 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 - `--log-generation-ppl`：让 Hugging Face 子进程在生成阶段写入 `generation_logprob_sum`、`generation_token_count`、`generation_nll` 和 `generation_ppl`。该 PPL 是模型对自己生成答案 token 的困惑度，不是参考答案困惑度。
 - `--log-generation-token-ppl`：让 Hugging Face 子进程额外写出 `<任务>.generation_tokens.jsonl`，记录每个生成 token 的 `logprob`、`nll` 和 `ppl`；该参数会自动启用样本级 `--log-generation-ppl`。
 - `--log-prefill-decode-timing`：让 Hugging Face 子进程额外写出 `<任务>.generation_timing.jsonl`，每条样本记录一次 `sample_timing`，包含 prefill/decode forward 阶段耗时。
-- `--profile-attention-kernels`：让 Hugging Face 子进程对每个任务输入 jsonl 第 0 行额外运行一次 `torch.profiler`，写出一条 `attention_profile`，统计严格 attention CUDA kernel 时间。该参数不能和 `--log-attention-scores` 同时使用。
-- `--attention-profile-sample-offset`：当前固定为 `0`，表示只 profile 输入 jsonl 第 0 行；传入其他值会报错。
+- `--profile-attention-kernels`：让 Hugging Face 子进程在正式生成时为每条样本写出一条 `attention_profile`，用 CUDA event 统计 attention op 时间。该参数不能和 `--log-attention-scores` 同时使用。
+- `--attention-profile-sample-offset`：兼容旧参数；当前 profile 覆盖所有实际预测样本，不再只采第 0 行。
 - `--mask-bos-token`：仅支持 `--server-type hf`。保留 tokenizer 自动插入的 BOS token，例如 Llama 的 `<|begin_of_text|>`，但把 position 0 的 `attention_mask` 置为 0，并显式保留原始 `position_ids`，用于对比“遮住整段文本起点 token”和正常输入的 RULER 分数差异。开启后预测 jsonl 会保留 `attention_mask_ablation` 元信息。
 - `--timing-file`：结构化任务耗时 jsonl；默认写到 `RULER/benchmark_root/local_eval/ruler_timing.jsonl`。
 - `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 csv 汇总。
@@ -335,7 +335,7 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
 
 如果要在预测时记录每个生成 token 的困惑度，应加上 `--log-generation-token-ppl`。该参数会同时保留主预测 jsonl 中的样本级 PPL 字段，并额外为每个任务写出 `<任务>.generation_tokens.jsonl`。
 
-如果要记录每条样本的 prefill/decode forward 耗时和每个任务第 0 行样本的严格 attention kernel 时间，应同时加上 `--log-prefill-decode-timing --profile-attention-kernels`。普通阶段耗时会覆盖每条样本；严格 profiler 固定每个 `model + length + task` 只采输入 jsonl 第 0 行。
+如果要记录每条样本的 prefill/decode forward 耗时和每条样本的 attention CUDA event 时间，应同时加上 `--log-prefill-decode-timing --profile-attention-kernels`。两类 timing 都会覆盖实际预测样本，统一写入 `<任务>.generation_timing.jsonl`。
 
 如果要跑遮住 `<|begin_of_text|>` 的 RULER 4k 全任务实验，可以给 Llama 单独起一个新的模型别名，并加上 `--mask-bos-token`：
 
@@ -407,8 +407,8 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n model python -u pred/cal
 - `--log_generation_ppl`：仅支持 `--server_type hf`。开启后在每条预测 jsonl 记录中追加生成答案 token 的 PPL 统计字段。
 - `--log_generation_token_ppl`：仅支持 `--server_type hf`。开启后额外写出 `<任务>.generation_tokens.jsonl`，记录每个生成 token 的 `logprob`、`nll` 和 `ppl`，并自动启用 `--log_generation_ppl`。
 - `--log_prefill_decode_timing`：仅支持 `--server_type hf`。开启后额外写出 `<任务>.generation_timing.jsonl` 的 `sample_timing` 记录，每条样本一行。
-- `--profile_attention_kernels`：仅支持 `--server_type hf`。开启后只对输入 jsonl 第 0 行额外写一条 `attention_profile` 记录，用 `torch.profiler` 统计 attention CUDA kernel 时间。
-- `--attention_profile_sample_offset`：当前固定为 `0`；传入其他值会报错。
+- `--profile_attention_kernels`：仅支持 `--server_type hf`。开启后对每条实际预测样本写一条 `attention_profile` 记录，用 CUDA event 统计 attention op 时间。
+- `--attention_profile_sample_offset`：兼容旧参数；当前不再用于抽样，profile 覆盖所有实际预测样本。
 - `--mask_bos_token`：仅支持 `--server_type hf`。保留 BOS token，但把 position 0 的 `attention_mask` 置为 0；适合单独调试遮住 `<|begin_of_text|>` 的一项任务。
 
 ### 6. 运行评分和统一测评汇总
@@ -440,9 +440,9 @@ conda run --no-capture-output -n model python eval/collect_results.py \
 
 `ruler_results_4k_all_models.csv` 是 `detail` 明细主表，汇总脚本还会生成同名前缀的四个 csv：
 
-- `ruler_results_4k_all_models_summary_by_model.csv`：每个模型一行，包含完成数量、平均分、平均 PPL、`total_task_elapsed_seconds`、`wall_time_seconds`、prefill/decode forward 聚合耗时、attention profiler 聚合字段和样本总数。
-- `ruler_results_4k_all_models_summary_by_model_and_length.csv`：每个 `model + length` 一行，按长度观察分数、PPL、任务耗时、prefill/decode forward 耗时和 attention profiler 指标变化。
-- `ruler_results_4k_all_models_summary_by_task.csv`：每个任务一行，记录平均分、最高分对应模型和长度、平均 PPL、平均耗时和 timing/profiler 聚合字段。
+- `ruler_results_4k_all_models_summary_by_model.csv`：每个模型一行，包含完成数量、平均分、平均 PPL、`total_task_elapsed_seconds`、`wall_time_seconds`、prefill/decode forward 聚合耗时、全样本 attention timing 聚合字段和样本总数。
+- `ruler_results_4k_all_models_summary_by_model_and_length.csv`：每个 `model + length` 一行，按长度观察分数、PPL、任务耗时、prefill/decode forward 耗时和全样本 attention timing 指标变化。
+- `ruler_results_4k_all_models_summary_by_task.csv`：每个任务一行，记录平均分、最高分对应模型和长度、平均 PPL、平均耗时和 timing/attention 聚合字段。
 - `ruler_results_4k_all_models_run_info.csv`：记录汇总时间、输入目录、模型/长度/任务列表和 score/PPL/time 口径。
 
 ### 7. 检查已有数据和结果

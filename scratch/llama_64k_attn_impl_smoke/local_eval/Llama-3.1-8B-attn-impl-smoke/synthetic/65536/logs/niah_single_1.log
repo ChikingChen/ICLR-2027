@@ -1,0 +1,47 @@
+$ CUDA_VISIBLE_DEVICES=0 /data/czy/miniconda3/envs/model/bin/python pred/call_api.py --data_dir ../../scratch/llama_64k_attn_impl_smoke/parquet_data/synthetic/65536/data --save_dir ../../scratch/llama_64k_attn_impl_smoke/local_eval/Llama-3.1-8B-attn-impl-smoke/synthetic/65536/pred --benchmark synthetic --task niah_single_1 --subset validation --server_type hf --model_name_or_path ../../models/Llama-3.1-8B --temperature 0.0 --top_k 32 --top_p 1.0 --random_seed 0 --batch_size 1 --log_batch_progress --log_attn_implementation
+[NeMo W 2026-05-30 08:15:33 nemo_logging:349] /data/czy/miniconda3/envs/model/lib/python3.10/site-packages/megatron/core/optimizer/__init__.py:18: UserWarning: Transformer Engine and Apex are not installed. Falling back to Torch optimizers.
+      warnings.warn(
+    
+[NeMo W 2026-05-30 08:15:33 nemo_logging:349] /data/czy/miniconda3/envs/model/lib/python3.10/site-packages/megatron/core/optimizer/optimizer.py:28: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+      warnings.warn(
+    
+[NeMo W 2026-05-30 08:15:33 nemo_logging:349] /data/czy/miniconda3/envs/model/lib/python3.10/site-packages/megatron/core/optimizer/clip_grads.py:29: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier, multi_tensor_l2norm, and multi_tensor_scale
+      warnings.warn(
+    
+[NeMo W 2026-05-30 08:15:33 nemo_logging:349] /data/czy/miniconda3/envs/model/lib/python3.10/site-packages/pydub/utils.py:170: RuntimeWarning: Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work
+      warn("Couldn't find ffmpeg or avconv - defaulting to ffmpeg, but may not work", RuntimeWarning)
+    
+Predict niah_single_1 
+from ../../scratch/llama_64k_attn_impl_smoke/parquet_data/synthetic/65536/data/niah_single_1/validation.jsonl
+to ../../scratch/llama_64k_attn_impl_smoke/local_eval/Llama-3.1-8B-attn-impl-smoke/synthetic/65536/pred/niah_single_1.jsonl
+
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
+Loading checkpoint shards:  25%|██▌       | 1/4 [00:33<01:40, 33.62s/it]
+Loading checkpoint shards:  50%|█████     | 2/4 [01:16<01:18, 39.03s/it]
+Loading checkpoint shards:  75%|███████▌  | 3/4 [01:55<00:39, 39.26s/it]
+Loading checkpoint shards: 100%|██████████| 4/4 [02:00<00:00, 25.47s/it]
+Loading checkpoint shards: 100%|██████████| 4/4 [02:00<00:00, 30.08s/it]
+Device set to use cuda:0
+[ATTN_IMPLEMENTATION] model.config._attn_implementation=flash_attention_2
+
+  0%|          | 0/3 [00:00<?, ?it/s][BATCH_START] task=niah_single_1 batch=1/3 size=1 index_range=0-0
+[NeMo W 2026-05-30 08:17:39 nemo_logging:349] /data/czy/miniconda3/envs/model/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:628: UserWarning: `do_sample` is set to `False`. However, `temperature` is set to `0.0` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `temperature`.
+      warnings.warn(
+    
+[NeMo W 2026-05-30 08:17:39 nemo_logging:349] /data/czy/miniconda3/envs/model/lib/python3.10/site-packages/transformers/generation/configuration_utils.py:650: UserWarning: `do_sample` is set to `False`. However, `top_k` is set to `32` -- this flag is only used in sample-based generation modes. You should set `do_sample=True` or unset `top_k`.
+      warnings.warn(
+    
+Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
+[BATCH_DONE] task=niah_single_1 batch=1/3 size=1 index_range=0-0 elapsed=22.59s
+
+ 33%|███▎      | 1/3 [00:22<00:45, 22.59s/it][BATCH_START] task=niah_single_1 batch=2/3 size=1 index_range=1-1
+Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
+[BATCH_DONE] task=niah_single_1 batch=2/3 size=1 index_range=1-1 elapsed=11.80s
+
+ 67%|██████▋   | 2/3 [00:34<00:16, 16.24s/it][BATCH_START] task=niah_single_1 batch=3/3 size=1 index_range=2-2
+Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
+[BATCH_DONE] task=niah_single_1 batch=3/3 size=1 index_range=2-2 elapsed=11.74s
+
+100%|██████████| 3/3 [00:46<00:00, 14.19s/it]
+100%|██████████| 3/3 [00:46<00:00, 15.38s/it]
+Used time: 2.9 minutes
