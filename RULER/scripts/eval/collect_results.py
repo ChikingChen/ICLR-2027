@@ -53,7 +53,10 @@ DETAIL_COLUMNS = [
     "decode_forward_ms_per_token_avg",
     "attention_profile_sample_line_no",
     "attention_profile_sample_index",
+    "attention_profile_records",
+    "prefill_attention_kernel_ms_total",
     "prefill_attention_kernel_ms",
+    "attention_profile_generated_token_count_total",
     "decode_attention_kernel_ms_total",
     "decode_attention_kernel_ms_per_token_avg",
     "attention_kernel_event_count",
@@ -78,6 +81,7 @@ SUMMARY_COLUMNS = [
     "total_decode_forward_ms",
     "avg_decode_forward_ms_per_token",
     "attention_profiled_tasks",
+    "attention_profile_records",
     "avg_prefill_attention_kernel_ms",
     "avg_decode_attention_kernel_ms_per_token",
     "total_samples",
@@ -100,6 +104,7 @@ SUMMARY_BY_LENGTH_COLUMNS = [
     "total_decode_forward_ms",
     "avg_decode_forward_ms_per_token",
     "attention_profiled_tasks",
+    "attention_profile_records",
     "avg_prefill_attention_kernel_ms",
     "avg_decode_attention_kernel_ms_per_token",
     "total_samples",
@@ -120,6 +125,7 @@ SUMMARY_BY_TASK_COLUMNS = [
     "total_decode_forward_ms",
     "avg_decode_forward_ms_per_token",
     "attention_profiled_tasks",
+    "attention_profile_records",
     "avg_prefill_attention_kernel_ms",
     "avg_decode_attention_kernel_ms_per_token",
     "total_samples",
@@ -323,6 +329,22 @@ def aggregate_generation_timing(rows: Sequence[Mapping[str, Any]]) -> Dict[str, 
         decode_per_token = decode_total / generated_token_total
 
     profile = profile_rows[0] if profile_rows else {}
+    profile_prefill_values = [
+        float(value)
+        for value in (row.get("prefill_attention_kernel_ms") for row in profile_rows)
+        if value is not None and value != ""
+    ]
+    profile_prefill_total = sum(profile_prefill_values) if profile_prefill_values else None
+    profile_generated_token_total = sum_optional(row.get("generated_token_count") for row in profile_rows)
+    profile_decode_total = sum_optional(row.get("decode_attention_kernel_ms_total") for row in profile_rows)
+    profile_decode_per_token = None
+    if (
+        profile_decode_total is not None
+        and profile_generated_token_total is not None
+        and profile_generated_token_total > 0
+    ):
+        profile_decode_per_token = profile_decode_total / profile_generated_token_total
+    profile_event_count = sum_optional(row.get("attention_kernel_event_count") for row in profile_rows)
     return {
         "sample_timing_records": len(sample_rows),
         "timing_generated_token_count_total": generated_token_total,
@@ -331,10 +353,14 @@ def aggregate_generation_timing(rows: Sequence[Mapping[str, Any]]) -> Dict[str, 
         "decode_forward_ms_per_token_avg": decode_per_token,
         "attention_profile_sample_line_no": profile.get("sample_line_no"),
         "attention_profile_sample_index": profile.get("sample_index"),
-        "prefill_attention_kernel_ms": _float_or_none(profile.get("prefill_attention_kernel_ms")),
-        "decode_attention_kernel_ms_total": _float_or_none(profile.get("decode_attention_kernel_ms_total")),
-        "decode_attention_kernel_ms_per_token_avg": _float_or_none(profile.get("decode_attention_kernel_ms_per_token_avg")),
-        "attention_kernel_event_count": profile.get("attention_kernel_event_count"),
+        "attention_profile_records": len(profile_rows),
+        "prefill_attention_kernel_records": len(profile_prefill_values),
+        "prefill_attention_kernel_ms_total": profile_prefill_total,
+        "prefill_attention_kernel_ms": average(profile_prefill_values),
+        "attention_profile_generated_token_count_total": profile_generated_token_total,
+        "decode_attention_kernel_ms_total": profile_decode_total,
+        "decode_attention_kernel_ms_per_token_avg": profile_decode_per_token,
+        "attention_kernel_event_count": None if profile_event_count is None else int(profile_event_count),
     }
 
 
@@ -469,6 +495,27 @@ def summarize_group(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     avg_decode_ms_per_token = None
     if total_decode_ms is not None and total_timing_tokens is not None and total_timing_tokens > 0:
         avg_decode_ms_per_token = total_decode_ms / total_timing_tokens
+    attention_profile_records = sum(int(row.get("attention_profile_records") or 0) for row in rows)
+    total_prefill_attention_ms = sum_optional(row.get("prefill_attention_kernel_ms_total") for row in rows)
+    prefill_attention_records = sum_optional(row.get("prefill_attention_kernel_records") for row in rows)
+    avg_prefill_attention_ms = None
+    if (
+        total_prefill_attention_ms is not None
+        and prefill_attention_records is not None
+        and prefill_attention_records > 0
+    ):
+        avg_prefill_attention_ms = total_prefill_attention_ms / prefill_attention_records
+    total_decode_attention_ms = sum_optional(row.get("decode_attention_kernel_ms_total") for row in rows)
+    total_attention_profile_tokens = sum_optional(
+        row.get("attention_profile_generated_token_count_total") for row in rows
+    )
+    avg_decode_attention_ms_per_token = None
+    if (
+        total_decode_attention_ms is not None
+        and total_attention_profile_tokens is not None
+        and total_attention_profile_tokens > 0
+    ):
+        avg_decode_attention_ms_per_token = total_decode_attention_ms / total_attention_profile_tokens
     return {
         "completed_tasks": len(completed),
         "total_tasks": total_tasks,
@@ -482,9 +529,10 @@ def summarize_group(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "total_prefill_forward_ms": sum_optional(row.get("prefill_forward_ms_total") for row in rows),
         "total_decode_forward_ms": total_decode_ms,
         "avg_decode_forward_ms_per_token": avg_decode_ms_per_token,
-        "attention_profiled_tasks": sum(1 for row in rows if row.get("attention_profile_sample_line_no") is not None),
-        "avg_prefill_attention_kernel_ms": average(row.get("prefill_attention_kernel_ms") for row in rows),
-        "avg_decode_attention_kernel_ms_per_token": average(row.get("decode_attention_kernel_ms_per_token_avg") for row in rows),
+        "attention_profiled_tasks": sum(1 for row in rows if int(row.get("attention_profile_records") or 0) > 0),
+        "attention_profile_records": attention_profile_records,
+        "avg_prefill_attention_kernel_ms": avg_prefill_attention_ms,
+        "avg_decode_attention_kernel_ms_per_token": avg_decode_attention_ms_per_token,
         "total_samples": sum(int(row.get("samples") or 0) for row in rows),
         "total_pred_lines": sum(int(row.get("pred_lines") or 0) for row in rows),
     }
@@ -539,6 +587,7 @@ def summary_by_task(detail: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]
                 "total_decode_forward_ms": group_summary["total_decode_forward_ms"],
                 "avg_decode_forward_ms_per_token": group_summary["avg_decode_forward_ms_per_token"],
                 "attention_profiled_tasks": group_summary["attention_profiled_tasks"],
+                "attention_profile_records": group_summary["attention_profile_records"],
                 "avg_prefill_attention_kernel_ms": group_summary["avg_prefill_attention_kernel_ms"],
                 "avg_decode_attention_kernel_ms_per_token": group_summary["avg_decode_attention_kernel_ms_per_token"],
                 "total_samples": sum(int(row.get("samples") or 0) for row in rows),
@@ -567,7 +616,7 @@ def build_run_info(
         {"key": "tasks", "value": ",".join(tasks)},
         {"key": "score_definition", "value": "复用 RULER eval/synthetic/constants.py 的任务 metric_fn。"},
         {"key": "ppl_definition", "value": "generation_nll=-sum(generation_logprob_sum)/sum(generation_token_count); generation_ppl=exp(nll)。"},
-        {"key": "time_definition", "value": "total_task_elapsed_seconds 为任务 elapsed_seconds 求和，wall_time_seconds 为同组 max(ended_at)-min(started_at)。"},
+        {"key": "time_definition", "value": "total_task_elapsed_seconds 为任务 elapsed_seconds 求和，wall_time_seconds 为同组 max(ended_at)-min(started_at)；attention timing 使用所有 attention_profile 样本记录加权平均。"},
         {"key": "notes", "value": "缺少预测文件记为 missing；预测行数少于输入样本数记为 failed。"},
     ]
 

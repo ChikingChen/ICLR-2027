@@ -96,9 +96,10 @@ parser.add_argument("--attention_top_k", type=int, default=8, help="每层注意
 parser.add_argument("--log_generation_ppl", action="store_true", help="输出 Hugging Face 生成答案 token 的 PPL。")
 parser.add_argument("--log_generation_token_ppl", action="store_true", help="额外输出 Hugging Face 每个生成 token 的 PPL 明细。")
 parser.add_argument("--log_prefill_decode_timing", action="store_true", help="输出 Hugging Face prefill/decode forward 阶段耗时。")
-parser.add_argument("--profile_attention_kernels", action="store_true", help="对每个任务第 0 行样本额外统计严格 attention CUDA kernel 时间。")
-parser.add_argument("--attention_profile_sample_offset", type=int, default=0, help="固定为 0，只 profile 输入 jsonl 第 0 行样本。")
+parser.add_argument("--profile_attention_kernels", action="store_true", help="对每条样本统计 attention CUDA event 时间。")
+parser.add_argument("--attention_profile_sample_offset", type=int, default=0, help="兼容旧参数；当前 profile 覆盖所有实际预测样本。")
 parser.add_argument("--mask_bos_token", action="store_true", help="保留 BOS token，但把 position 0 的 attention_mask 置为 0。")
+parser.add_argument("--log_attn_implementation", action="store_true", help="输出 Hugging Face 模型实际启用的 attention 实现。")
 
 
 def validate_runtime_args(parsed_args):
@@ -118,10 +119,10 @@ def validate_runtime_args(parsed_args):
         raise ValueError("--log_prefill_decode_timing 和 --profile_attention_kernels 目前只支持 --server_type hf")
     if parsed_args.mask_bos_token and parsed_args.server_type != "hf":
         raise ValueError("--mask_bos_token 目前只支持 --server_type hf")
+    if parsed_args.log_attn_implementation and parsed_args.server_type != "hf":
+        raise ValueError("--log_attn_implementation 目前只支持 --server_type hf")
     if parsed_args.profile_attention_kernels and parsed_args.log_attention_scores:
         raise ValueError("--profile_attention_kernels 需要保持 flash attention 路径，不能和 --log_attention_scores 同时使用。")
-    if parsed_args.attention_profile_sample_offset != 0:
-        raise ValueError("--attention_profile_sample_offset 当前固定为 0，也就是只采输入 jsonl 第 0 行。")
     if parsed_args.log_generation_token_ppl:
         parsed_args.log_generation_ppl = True
     parsed_args.stop_words = list(filter(None, parsed_args.stop_words.split(',')))
@@ -222,6 +223,7 @@ def get_llm(tokens_to_generate):
             log_prefill_decode_timing=args.log_prefill_decode_timing,
             profile_attention_kernels=args.profile_attention_kernels,
             mask_bos_token=args.mask_bos_token,
+            log_attn_implementation=args.log_attn_implementation,
         )
     
     elif args.server_type == 'mamba':
@@ -403,51 +405,19 @@ def build_generation_timing_record(pred, index, task, sample_line_no):
     return record
 
 
-def select_attention_profile_sample(data, sample_offset=0):
-    """选择严格 profiler 样本；当前固定只允许输入 jsonl 第 0 行。"""
-
-    if sample_offset != 0:
-        raise ValueError("attention profiler 当前固定只采输入 jsonl 第 0 行。")
-    if not data:
-        return None
-    return {
-        "sample_line_no": 0,
-        "sample": data[0],
-    }
-
-
 def build_attention_profile_record(profile, task, sample, sample_line_no, input_file):
-    """把第 0 行样本的严格 attention profiler 结果转换成 sidecar jsonl 记录。"""
+    """把单条样本的 attention timing 结果转换成 sidecar jsonl 记录。"""
 
     record = {
         "record_type": "attention_profile",
         "task": task,
-        "profile_sample_policy": "first_input_record",
+        "profile_sample_policy": "all_input_records",
         "sample_line_no": sample_line_no,
         "sample_index": sample.get("index"),
         "input_file": str(input_file),
     }
     record.update(profile)
     return record
-
-
-def timing_sidecar_has_attention_profile(path):
-    """判断 timing sidecar 是否已经存在 attention_profile 记录，避免续跑重复追加。"""
-
-    if not path.exists():
-        return False
-    with path.open("r", encoding="utf-8") as file_obj:
-        for line in file_obj:
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                record = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            if record.get("record_type") == "attention_profile":
-                return True
-    return False
 
 
 def main():
@@ -554,6 +524,14 @@ def main():
                     task=args.task,
                     sample_line_no=sample_line_no,
                 )
+            if isinstance(pred, dict) and pred.get("attention_profile") is not None:
+                attention_profile_parallel[idx] = build_attention_profile_record(
+                    profile=pred["attention_profile"],
+                    task=args.task,
+                    sample={"index": index},
+                    sample_line_no=sample_line_no,
+                    input_file=task_file,
+                )
 
         if args.log_batch_progress:
             elapsed = time.time() - batch_meta['started_at']
@@ -573,6 +551,7 @@ def main():
     attention_parallel = [{} for _ in range(len(data))]
     generation_token_parallel = [{} for _ in range(len(data))]
     generation_timing_parallel = [{} for _ in range(len(data))]
+    attention_profile_parallel = [{} for _ in range(len(data))]
 
     batched_data = []
     batch = []
@@ -616,40 +595,6 @@ def main():
         if args.log_prefill_decode_timing or args.profile_attention_kernels:
             generation_timing_jsonl = stack.enter_context(open(generation_timing_jsonl_file, 'at', encoding="utf-8", buffering=1))
             print(f"生成阶段 timing 明细写入 {generation_timing_jsonl_file}", flush=True)
-
-        if args.profile_attention_kernels and not timing_sidecar_has_attention_profile(generation_timing_jsonl_file):
-            profile_sample = select_attention_profile_sample(
-                all_data,
-                sample_offset=args.attention_profile_sample_offset,
-            )
-            if profile_sample is not None:
-                sample = profile_sample["sample"]
-                try:
-                    profile = llm.profile_attention_kernels_for_prompt(sample["input"])
-                except Exception as error:
-                    profile = {
-                        "timer_backend": "torch_profiler",
-                        "input_tokens": None,
-                        "generated_token_count": None,
-                        "prefill_attention_kernel_ms": None,
-                        "decode_attention_kernel_ms_total": None,
-                        "decode_attention_kernel_ms_per_token_avg": None,
-                        "attention_kernel_event_count": 0,
-                        "warning": f"{type(error).__name__}: {error}",
-                    }
-                generation_timing_jsonl.write(
-                    json.dumps(
-                        build_attention_profile_record(
-                            profile=profile,
-                            task=args.task,
-                            sample=sample,
-                            sample_line_no=profile_sample["sample_line_no"],
-                            input_file=task_file,
-                        ),
-                        ensure_ascii=False,
-                    )
-                    + '\n'
-                )
 
         # the data is processed sequentially, so we can store the start and end of current processing window
         start_idx = 0  # window: [start_idx, end_idx]
@@ -719,6 +664,8 @@ def main():
                         generation_token_jsonl.write(json.dumps(generation_token_parallel[idx], ensure_ascii=False) + '\n')
                     if generation_timing_jsonl is not None and len(generation_timing_parallel[idx]) > 0:
                         generation_timing_jsonl.write(json.dumps(generation_timing_parallel[idx], ensure_ascii=False) + '\n')
+                    if generation_timing_jsonl is not None and len(attention_profile_parallel[idx]) > 0:
+                        generation_timing_jsonl.write(json.dumps(attention_profile_parallel[idx], ensure_ascii=False) + '\n')
 
                 start_idx = end_idx + 1
 

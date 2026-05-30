@@ -19,7 +19,8 @@ import requests
 import time
 import torch
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from functools import wraps
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 
 ATTENTION_KERNEL_NAME_PARTS = (
@@ -29,6 +30,14 @@ ATTENTION_KERNEL_NAME_PARTS = (
     "fmha",
     "sdpa",
     "attention",
+)
+
+ATTENTION_PROFILE_GENERATION_KWARGS_TO_DROP = (
+    "return_dict_in_generate",
+    "output_scores",
+    "output_logits",
+    "output_attentions",
+    "output_hidden_states",
 )
 
 
@@ -339,6 +348,192 @@ def measure_callable_ms(
     return result, elapsed_ms, "perf_counter"
 
 
+def _callable_globals(func: Callable) -> Optional[Dict[str, Any]]:
+    """Return the globals dict behind a function or bound method."""
+
+    raw_func = getattr(func, "__func__", func)
+    globals_dict = getattr(raw_func, "__globals__", None)
+    if isinstance(globals_dict, dict):
+        return globals_dict
+    return None
+
+
+class CudaEventAttentionTimer:
+    """Record attention op time by wrapping known attention call sites with CUDA events."""
+
+    def __init__(self, model=None) -> None:
+        self.model = model
+        self._patches: List[tuple] = []
+        self._patched_keys = set()
+        self._records: List[dict] = []
+        self._recording_depth = 0
+        self.timer_backend = (
+            "cuda_event_attention_ops"
+            if torch.cuda.is_available()
+            else "perf_counter_attention_ops"
+        )
+
+    def __enter__(self):
+        if self.model is not None:
+            self.patch_model(self.model)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.restore()
+        return False
+
+    def patch_function(self, namespace: Dict[str, Any], name: str, label: Optional[str] = None) -> bool:
+        """Temporarily wrap `namespace[name]` and record each successful call."""
+
+        if namespace is None or name not in namespace:
+            return False
+        original = namespace.get(name)
+        if not callable(original):
+            return False
+
+        key = (id(namespace), name)
+        if key in self._patched_keys:
+            return False
+
+        call_label = label or name
+
+        @wraps(original)
+        def wrapped(*args, **kwargs):
+            return self._record_call(call_label, original, args, kwargs)
+
+        self._patched_keys.add(key)
+        self._patches.append((namespace, name, original))
+        namespace[name] = wrapped
+        return True
+
+    def patch_model(self, model) -> int:
+        """Patch common HF/GLM attention functions reachable from model modules."""
+
+        patched_count = 0
+        patched_count += int(
+            self.patch_function(
+                torch.nn.functional.__dict__,
+                "scaled_dot_product_attention",
+                "scaled_dot_product_attention",
+            )
+        )
+
+        modules = model.modules() if hasattr(model, "modules") else []
+        for submodule in modules:
+            globals_dict = _callable_globals(getattr(submodule, "forward", None))
+            if globals_dict is None:
+                continue
+
+            # HF Llama/Qwen FlashAttention classes call this helper. Timing this
+            # helper avoids double-counting nested flash_attn_func calls.
+            if callable(globals_dict.get("_flash_attention_forward")):
+                patched_count += int(
+                    self.patch_function(
+                        globals_dict,
+                        "_flash_attention_forward",
+                        "_flash_attention_forward",
+                    )
+                )
+                continue
+
+            for name in ("flash_attn_func", "flash_attn_varlen_func", "scaled_dot_product_attention"):
+                patched_count += int(self.patch_function(globals_dict, name, name))
+
+        return patched_count
+
+    def restore(self) -> None:
+        """Restore all wrapped functions in reverse patch order."""
+
+        while self._patches:
+            namespace, name, original = self._patches.pop()
+            namespace[name] = original
+        self._patched_keys.clear()
+
+    def _record_call(self, label: str, func: Callable, args: Sequence[Any], kwargs: Dict[str, Any]):
+        if self._recording_depth > 0:
+            return func(*args, **kwargs)
+
+        device = _first_cuda_device(args, kwargs)
+        if torch.cuda.is_available() and device is not None:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            self._recording_depth += 1
+            with torch.cuda.device(device):
+                start_event.record(torch.cuda.current_stream(device))
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                raise
+            else:
+                with torch.cuda.device(device):
+                    end_event.record(torch.cuda.current_stream(device))
+                self._records.append(
+                    {
+                        "label": label,
+                        "device": device,
+                        "start_event": start_event,
+                        "end_event": end_event,
+                        "backend": "cuda_event_attention_ops",
+                    }
+                )
+                return result
+            finally:
+                self._recording_depth -= 1
+
+        started_at = time.perf_counter()
+        self._recording_depth += 1
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            raise
+        else:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            self._records.append(
+                {
+                    "label": label,
+                    "elapsed_ms": elapsed_ms,
+                    "backend": "perf_counter_attention_ops",
+                }
+            )
+            return result
+        finally:
+            self._recording_depth -= 1
+
+    def summary(self) -> dict:
+        cuda_devices = {}
+        for record in self._records:
+            if record.get("backend") == "cuda_event_attention_ops":
+                device = record.get("device")
+                cuda_devices[str(device)] = device
+
+        for device in cuda_devices.values():
+            torch.cuda.synchronize(device)
+
+        total_ms = 0.0
+        for record in self._records:
+            if record.get("backend") == "cuda_event_attention_ops":
+                elapsed_ms = float(record["start_event"].elapsed_time(record["end_event"]))
+            else:
+                elapsed_ms = float(record.get("elapsed_ms", 0.0))
+            record["elapsed_ms"] = elapsed_ms
+            total_ms += elapsed_ms
+
+        event_count = len(self._records)
+        backend = (
+            "cuda_event_attention_ops"
+            if any(record.get("backend") == "cuda_event_attention_ops" for record in self._records)
+            else self.timer_backend
+        )
+        summary = {
+            "timer_backend": backend,
+            "attention_kernel_event_count": event_count,
+            "attention_kernel_ms": total_ms if event_count else None,
+        }
+        if event_count == 0:
+            summary["warning"] = "CUDA event attention timer 没有捕获到 attention op 调用。"
+        return summary
+
+
 class ForwardTimingCollector:
     """在 Hugging Face `generate()` 期间按 prefill/decode 记录 forward 耗时。"""
 
@@ -375,6 +570,62 @@ class ForwardTimingCollector:
         )
 
 
+class AttentionTimingCollector:
+    """在 Hugging Face `generate()` 期间按 prefill/decode 记录 attention op 耗时。"""
+
+    def __init__(self) -> None:
+        self.prefill_attention_ms: List[float] = []
+        self.decode_attention_ms: List[float] = []
+        self.attention_kernel_event_count = 0
+        self.timer_backend = "unknown"
+        self.warnings: List[str] = []
+
+    def classify(self, kwargs: Dict[str, Any]) -> str:
+        """根据 KV cache 和调用顺序判断当前 forward 属于 prefill 还是 decode。"""
+
+        past_key_values = kwargs.get("past_key_values")
+        if past_key_values is None and not self.prefill_attention_ms:
+            return "prefill"
+        return "decode"
+
+    def record(self, phase: str, summary: Mapping[str, Any]) -> None:
+        """记录一次 forward 内部 attention op 的 CUDA event 汇总。"""
+
+        self.timer_backend = str(summary.get("timer_backend") or self.timer_backend)
+        self.attention_kernel_event_count += int(summary.get("attention_kernel_event_count") or 0)
+        attention_ms = summary.get("attention_kernel_ms")
+        if attention_ms is not None:
+            if phase == "prefill":
+                self.prefill_attention_ms.append(float(attention_ms))
+            else:
+                self.decode_attention_ms.append(float(attention_ms))
+        if summary.get("warning"):
+            warning = str(summary["warning"])
+            if warning not in self.warnings:
+                self.warnings.append(warning)
+
+    def summary(self, generated_token_count: int, input_tokens: int) -> dict:
+        """返回当前样本的 attention timing 字段。"""
+
+        prefill_total = sum(self.prefill_attention_ms) if self.prefill_attention_ms else None
+        decode_total = sum(self.decode_attention_ms) if self.decode_attention_ms else 0.0
+        decode_per_token = None
+        if generated_token_count > 0 and decode_total is not None:
+            decode_per_token = decode_total / generated_token_count
+        result = {
+            "timer_backend": self.timer_backend,
+            "input_tokens": int(input_tokens),
+            "generated_token_count": int(generated_token_count),
+            "prefill_attention_kernel_ms": prefill_total,
+            "decode_attention_kernel_ms_total": decode_total,
+            "decode_attention_kernel_ms_per_token_avg": decode_per_token,
+            "attention_kernel_event_count": self.attention_kernel_event_count,
+        }
+        if self.warnings:
+            result["warning"] = "；".join(self.warnings)
+        return result
+
+
 class HuggingFaceModel:
     def __init__(self, name_or_path: str, **generation_kwargs) -> None:
         from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -385,6 +636,7 @@ class HuggingFaceModel:
         self.log_prefill_decode_timing = bool(generation_kwargs.pop("log_prefill_decode_timing", False))
         self.profile_attention_kernels = bool(generation_kwargs.pop("profile_attention_kernels", False))
         self.mask_bos_token = bool(generation_kwargs.pop("mask_bos_token", False))
+        self.log_attn_implementation = bool(generation_kwargs.pop("log_attn_implementation", False))
         if self.log_generation_token_ppl:
             self.log_generation_ppl = True
         self.attention_top_k = int(generation_kwargs.pop("attention_top_k", 8))
@@ -437,8 +689,16 @@ class HuggingFaceModel:
 
         if self.pipeline is not None:
             ensure_num_hidden_layers_alias(self.pipeline.model.config)
+            active_model = self.pipeline.model
         else:
             ensure_num_hidden_layers_alias(self.model.config)
+            active_model = self.model
+        if self.log_attn_implementation:
+            print(
+                "[ATTN_IMPLEMENTATION] model.config._attn_implementation="
+                f"{getattr(active_model.config, '_attn_implementation', None)}",
+                flush=True,
+            )
             
         self.generation_kwargs = generation_kwargs
         self.stop = self.generation_kwargs.pop('stop')
@@ -527,20 +787,34 @@ class HuggingFaceModel:
         finally:
             self.model.prepare_inputs_for_generation = original_prepare
 
-    def _generate_with_forward_timing(self, inputs) -> tuple:
-        """运行 `generate()` 并用临时 forward wrapper 采集 prefill/decode 耗时。"""
+    def _generate_with_runtime_timing(self, inputs) -> tuple:
+        """运行 `generate()` 并按需采集 forward 和 attention timing。"""
 
-        collector = ForwardTimingCollector()
+        forward_collector = ForwardTimingCollector() if self.log_prefill_decode_timing else None
+        attention_collector = AttentionTimingCollector() if self.profile_attention_kernels else None
         original_forward = self.model.forward
 
         def timed_forward(*forward_args, **forward_kwargs):
-            phase = collector.classify(forward_kwargs)
-            result, elapsed_ms, timer_backend = measure_callable_ms(
-                original_forward,
-                forward_args,
-                forward_kwargs,
-            )
-            collector.record(phase, elapsed_ms, timer_backend)
+            classifier = forward_collector or attention_collector
+            phase = classifier.classify(forward_kwargs) if classifier is not None else "decode"
+
+            def run_forward():
+                if forward_collector is None:
+                    return original_forward(*forward_args, **forward_kwargs)
+                result, elapsed_ms, timer_backend = measure_callable_ms(
+                    original_forward,
+                    forward_args,
+                    forward_kwargs,
+                )
+                forward_collector.record(phase, elapsed_ms, timer_backend)
+                return result
+
+            if attention_collector is None:
+                return run_forward()
+
+            with CudaEventAttentionTimer(self.model) as timer:
+                result = run_forward()
+            attention_collector.record(phase, timer.summary())
             return result
 
         self.model.forward = timed_forward
@@ -552,6 +826,12 @@ class HuggingFaceModel:
                 )
         finally:
             self.model.forward = original_forward
+        return generated_output, forward_collector, attention_collector
+
+    def _generate_with_forward_timing(self, inputs) -> tuple:
+        """运行 `generate()` 并用临时 forward wrapper 采集 prefill/decode 耗时。"""
+
+        generated_output, collector, _ = self._generate_with_runtime_timing(inputs)
         return generated_output, collector
 
     def _generate_without_timing(self, inputs):
@@ -563,18 +843,58 @@ class HuggingFaceModel:
                 **self.generation_kwargs,
             )
 
+    def _generation_kwargs_for_attention_profile(self) -> dict:
+        """Return generation kwargs that avoid retaining score/logit tensors."""
+
+        profile_kwargs = dict(self.generation_kwargs)
+        for key in ATTENTION_PROFILE_GENERATION_KWARGS_TO_DROP:
+            profile_kwargs.pop(key, None)
+        profile_kwargs["num_logits_to_keep"] = 1
+        return profile_kwargs
+
+    def _generate_for_attention_profile(self, inputs):
+        """Generate only token ids for attention replay, without score retention."""
+
+        profile_kwargs = self._generation_kwargs_for_attention_profile()
+        try:
+            with self._preserve_positions_for_masked_bos_generation():
+                return self.model.generate(
+                    **self._inputs_for_generate(inputs),
+                    **profile_kwargs,
+                )
+        except (TypeError, ValueError) as error:
+            if "num_logits_to_keep" not in str(error):
+                raise
+            profile_kwargs.pop("num_logits_to_keep", None)
+            with self._preserve_positions_for_masked_bos_generation():
+                return self.model.generate(
+                    **self._inputs_for_generate(inputs),
+                    **profile_kwargs,
+                )
+
+    def _model_forward_for_attention_profile(self, model_inputs: Dict[str, Any]):
+        """Run model forward with smallest useful logits output when supported."""
+
+        try:
+            return self.model(**model_inputs, num_logits_to_keep=1)
+        except (TypeError, ValueError) as error:
+            if "num_logits_to_keep" not in str(error):
+                raise
+            return self.model(**model_inputs)
+
     def process_batch(self, prompts: List[str], **kwargs) -> List[dict]:
         if self.log_attention_scores:
             return [self._process_one_with_attention(prompt) for prompt in prompts]
 
         timing_collector = None
+        attention_timing_collector = None
         attention_mask_ablation = None
         if self.pipeline is None:
-            if self.log_prefill_decode_timing and len(prompts) != 1:
-                raise ValueError("prefill/decode timing 只支持 batch_size=1。")
+            if (self.log_prefill_decode_timing or self.profile_attention_kernels) and len(prompts) != 1:
+                raise ValueError("prefill/decode timing 和 attention timing 只支持 batch_size=1。")
             inputs, attention_mask_ablation = self._prepare_generation_inputs(prompts, padding=True)
-            if self.log_prefill_decode_timing:
-                generated_output, timing_collector = self._generate_with_forward_timing(inputs)
+            if self.log_prefill_decode_timing or self.profile_attention_kernels:
+                generated_output, timing_collector, attention_timing_collector = self._generate_with_runtime_timing(inputs)
             else:
                 generated_output = self._generate_without_timing(inputs)
             if hasattr(generated_output, "sequences"):
@@ -625,6 +945,13 @@ class HuggingFaceModel:
                 timing = timing_collector.summary(generated_token_count=generated_token_count)
                 timing["input_tokens"] = int(input_length)
                 result["generation_timing"] = timing
+            if attention_timing_collector is not None:
+                input_length = inputs["input_ids"].shape[1]
+                generated_token_count = int(generated_ids[result_idx, input_length:].numel())
+                result["attention_profile"] = attention_timing_collector.summary(
+                    generated_token_count=generated_token_count,
+                    input_tokens=int(input_length),
+                )
             if attention_mask_ablation is not None:
                 result["attention_mask_ablation"] = attention_mask_ablation
             results.append(result)
@@ -675,34 +1002,31 @@ class HuggingFaceModel:
             result["generation_timing"] = timing
         return result
 
-    def _profile_callable(self, func: Callable) -> tuple:
-        """运行一次 callable，并返回 torch profiler 采集到的事件。"""
+    def _measure_attention_callable(self, func: Callable) -> tuple:
+        """运行一次 callable，并用 CUDA event wrapper 统计 attention op 耗时。"""
 
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        with torch.profiler.profile(activities=activities, record_shapes=False, profile_memory=False) as profiler:
+        with CudaEventAttentionTimer(self.model) as timer:
             result = func()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        return result, profiler.events()
+        return result, timer.summary()
 
     def _profile_prefill_attention(self, inputs) -> tuple:
-        """只 profile full prompt prefill forward 的 attention kernel。"""
+        """Measure full prompt prefill forward attention op time."""
 
         def run_prefill():
             with torch.no_grad():
-                return self.model(
-                    **inputs,
-                    use_cache=True,
-                    return_dict=True,
+                model_inputs = dict(inputs)
+                model_inputs.update(
+                    {
+                        "use_cache": True,
+                        "return_dict": True,
+                    }
                 )
+                return self._model_forward_for_attention_profile(model_inputs)
 
-        prefill_outputs, events = self._profile_callable(run_prefill)
-        return prefill_outputs, summarize_attention_kernel_events(events)
+        return self._measure_attention_callable(run_prefill)
 
     def _profile_decode_attention(self, inputs, past_key_values, generated_token_ids: torch.Tensor) -> dict:
-        """基于已生成 token replay decode forward，并统计 attention kernel。"""
+        """Replay decode forward for generated tokens and measure attention op time."""
 
         if generated_token_ids.numel() <= 1:
             return {
@@ -742,16 +1066,16 @@ class HuggingFaceModel:
                             dtype=position_ids.dtype,
                             device=position_ids.device,
                         )
-                    outputs = self.model(**step_inputs)
+                    outputs = self._model_forward_for_attention_profile(step_inputs)
                     next_past = getattr(outputs, "past_key_values", None)
                     if next_past is not None:
                         past_key_values = next_past
 
-        _, events = self._profile_callable(run_decode)
-        return summarize_attention_kernel_events(events)
+        _, summary = self._measure_attention_callable(run_decode)
+        return summary
 
     def profile_attention_kernels_for_prompt(self, prompt: str) -> dict:
-        """对单条 prompt 额外执行严格 profiler，返回 prefill/decode attention kernel 耗时。"""
+        """对单条 prompt 额外执行事件计时，返回 prefill/decode attention op 耗时。"""
 
         if self.pipeline is not None:
             raise RuntimeError("attention kernel profiling 需要直接 Hugging Face model，不能使用 pipeline。")
@@ -759,7 +1083,7 @@ class HuggingFaceModel:
         inputs, attention_mask_ablation = self._prepare_generation_inputs([prompt], padding=False)
         input_length = int(inputs["input_ids"].shape[1])
         result = {
-            "timer_backend": "torch_profiler",
+            "timer_backend": "cuda_event_attention_ops",
             "input_tokens": input_length,
             "generated_token_count": 0,
             "prefill_attention_kernel_ms": None,
@@ -774,7 +1098,7 @@ class HuggingFaceModel:
             return result
 
         with torch.no_grad():
-            generated_output = self._generate_without_timing(inputs)
+            generated_output = self._generate_for_attention_profile(inputs)
         sequences = generated_output.sequences if hasattr(generated_output, "sequences") else generated_output
         generated_token_ids = sequences[0, input_length:].detach()
         generated_token_count = int(generated_token_ids.numel())

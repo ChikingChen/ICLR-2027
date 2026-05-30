@@ -85,6 +85,7 @@ class RunnerConfig(NamedTuple):
     profile_attention_kernels: bool
     attention_profile_sample_offset: int
     mask_bos_token: bool
+    log_attn_implementation: bool
     overwrite_existing: bool
     timing_file: Path
     auto_evaluate: bool
@@ -332,6 +333,8 @@ def build_call_api_command(job: Job, config: RunnerConfig) -> List[str]:
         command.extend(["--attention_profile_sample_offset", str(config.attention_profile_sample_offset)])
     if config.mask_bos_token:
         command.append("--mask_bos_token")
+    if config.log_attn_implementation:
+        command.append("--log_attn_implementation")
     return command
 
 
@@ -445,18 +448,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile-attention-kernels",
         action="store_true",
-        help="让 Hugging Face 子进程额外对每个任务第 0 行样本统计严格 attention CUDA kernel 时间。",
+        help="让 Hugging Face 子进程对每条样本统计 attention CUDA event 时间。",
     )
     parser.add_argument(
         "--attention-profile-sample-offset",
         type=int,
         default=0,
-        help="固定为 0，只 profile 输入 jsonl 第 0 行样本。",
+        help="兼容旧参数；当前 profile 覆盖所有实际预测样本。",
     )
     parser.add_argument(
         "--mask-bos-token",
         action="store_true",
         help="保留 BOS token，但把 position 0 的 attention_mask 置为 0，用于遮住 <|begin_of_text|> 的实验。",
+    )
+    parser.add_argument(
+        "--log-attn-implementation",
+        action="store_true",
+        help="让 Hugging Face 子进程输出 model.config._attn_implementation。",
     )
     parser.add_argument(
         "--timing-file",
@@ -497,8 +505,6 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         raise ValueError("--attention-top-k 必须是正整数")
     if args.profile_attention_kernels and args.log_attention_scores:
         raise ValueError("--profile-attention-kernels 不能和 --log-attention-scores 同时使用")
-    if args.attention_profile_sample_offset != 0:
-        raise ValueError("--attention-profile-sample-offset 当前固定为 0")
     timing_file = args.timing_file if args.timing_file is not None else args.output_root / DEFAULT_TIMING_NAME
     report_file = args.report_file if args.report_file is not None else args.output_root / DEFAULT_REPORT_NAME
     if report_file.suffix.lower() != ".csv":
@@ -529,6 +535,7 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         profile_attention_kernels=args.profile_attention_kernels,
         attention_profile_sample_offset=args.attention_profile_sample_offset,
         mask_bos_token=args.mask_bos_token,
+        log_attn_implementation=args.log_attn_implementation,
         overwrite_existing=args.overwrite_existing,
         timing_file=timing_file,
         auto_evaluate=args.auto_evaluate,
@@ -551,7 +558,12 @@ def shell_join(command: Sequence[str]) -> str:
 def is_batch_progress_line(line: str) -> bool:
     """判断子进程输出是否是需要回显到 runner 终端的 batch 进度行。"""
 
-    return "[BATCH_START]" in line or "[BATCH_DONE]" in line or "[BATCH_FAILED]" in line
+    return (
+        "[BATCH_START]" in line
+        or "[BATCH_DONE]" in line
+        or "[BATCH_FAILED]" in line
+        or "[ATTN_IMPLEMENTATION]" in line
+    )
 
 
 def stream_child_output(
