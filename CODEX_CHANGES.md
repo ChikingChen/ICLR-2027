@@ -1,5 +1,30 @@
 # CODEX 变更说明
 
+## 2026-06-01 新增 FlashAttention 实验数据自动同步
+
+### 变更文件
+
+- `AGENTS.md`
+- `RULER/scripts/run_parquet_parallel.py`
+- `RULER/scripts/eval/collect_results.py`
+- `tests/test_run_parquet_parallel.py`
+- `tests/test_collect_results.py`
+- `CODEX_CHANGES.md`
+
+### 变更目的
+
+为默认三模型 4k 到 64k FlashAttention RULER 实验增加显式同步入口。`run_parquet_parallel.py` 新增 `--flashattention-experiment-dir`，在 `--auto-evaluate` 调用 `collect_results.py` 时透传该目录。
+
+`collect_results.py` 新增同名参数和 `write_flashattention_experiment_data()`。当传入实验目录时，汇总完成后会生成或覆盖 `experiment_data/FlashAttention/` 下三张最终 CSV：`Llama_flashattention_ruler_scores.csv`、`Qwen_flashattention_ruler_scores.csv` 和 `GLM_flashattention_ruler_scores.csv`。写入前会校验三模型、4k/8k/16k/32k/64k、13 个任务全部完成，预测行数等于输入样本数，每条预测都有 attention profile 记录，且 profile backend 必须为 `cuda_event_attention_ops`，避免把不完整或 CPU fallback timing 写入最终实验表。
+
+### 验证方式
+
+已按 TDD 先写红测确认同步函数和 runner 参数缺失，再实现功能。最终验证：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 conda run --no-capture-output -n model python -m unittest tests.test_collect_results tests.test_run_parquet_parallel
+```
+
 ## 2026-05-30 新增真实 QK pooling attention 输出
 
 ### 变更文件

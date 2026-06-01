@@ -90,6 +90,7 @@ class RunnerConfig(NamedTuple):
     timing_file: Path
     auto_evaluate: bool
     report_file: Path
+    flashattention_experiment_dir: Optional[Path]
 
 
 class RunningJob(NamedTuple):
@@ -482,6 +483,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="自动汇总 csv 主输出路径；默认写到 output-root/ruler_results.csv。",
     )
     parser.add_argument(
+        "--flashattention-experiment-dir",
+        type=Path,
+        default=None,
+        help="可选：自动汇总后把三模型 4k-64k FlashAttention 结果同步到指定实验数据目录。",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="只打印将要执行的任务和命令，不启动推理。",
@@ -540,6 +547,7 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         timing_file=timing_file,
         auto_evaluate=args.auto_evaluate,
         report_file=report_file,
+        flashattention_experiment_dir=args.flashattention_experiment_dir,
     )
 
 
@@ -657,7 +665,7 @@ def build_collect_results_command(
 ) -> List[str]:
     """构造自动汇总脚本命令。"""
 
-    return [
+    command = [
         config.python,
         "eval/collect_results.py",
         "--output-root",
@@ -677,6 +685,14 @@ def build_collect_results_command(
         "--output-file",
         str(config.report_file),
     ]
+    if config.flashattention_experiment_dir is not None:
+        command.extend(
+            [
+                "--flashattention-experiment-dir",
+                str(config.flashattention_experiment_dir),
+            ]
+        )
+    return command
 
 
 def run_collect_results(

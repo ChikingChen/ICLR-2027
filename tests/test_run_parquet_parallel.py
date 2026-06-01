@@ -399,6 +399,40 @@ class RunParquetParallelTest(unittest.TestCase):
             self.assertIn("--output-file", command)
             self.assertIn(str(config.report_file), command)
 
+    def test_collect_results_command_includes_flashattention_experiment_dir(self):
+        module = _load_module()
+        args = module.build_parser().parse_args(
+            [
+                "--model",
+                "llama=/models/llama",
+                "--seq-lengths",
+                "4096",
+                "--tasks",
+                "niah_single_1",
+                "--gpus",
+                "0",
+                "--auto-evaluate",
+                "--flashattention-experiment-dir",
+                "/repo/experiment_data/FlashAttention",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            args.data_root = root / "parquet"
+            args.output_root = root / "local_eval"
+            config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
+
+            command = module.build_collect_results_command(
+                config=config,
+                models=["llama"],
+                seq_lengths=[4096],
+                tasks=["niah_single_1"],
+            )
+
+            self.assertEqual(config.flashattention_experiment_dir, Path("/repo/experiment_data/FlashAttention"))
+            self.assertIn("--flashattention-experiment-dir", command)
+            self.assertIn("/repo/experiment_data/FlashAttention", command)
+
     def test_report_file_rejects_xlsx_suffix(self):
         module = _load_module()
         args = module.build_parser().parse_args(

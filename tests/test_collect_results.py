@@ -30,6 +30,49 @@ def _read_csv(path):
         return list(csv.DictReader(file_obj))
 
 
+def _make_flashattention_workbook(module):
+    detail = []
+    summary_by_model_and_length = []
+    models = [
+        "Llama-3.1-8B",
+        "Qwen2.5-7B-Instruct-1M",
+        "GLM-4-9B-Chat-1M",
+    ]
+    lengths = [4096, 8192, 16384, 32768, 65536]
+    for model_idx, model in enumerate(models):
+        for length_idx, length in enumerate(lengths):
+            for task_idx, task in enumerate(module.SYNTHETIC_TASKS):
+                detail.append(
+                    {
+                        "model": model,
+                        "length": length,
+                        "task": task,
+                        "status": "completed",
+                        "score": 80 + model_idx + length_idx + task_idx / 100,
+                        "samples": 500,
+                        "pred_lines": 500,
+                        "attention_profile_records": 500,
+                        "attention_profile_timer_backends": "cuda_event_attention_ops",
+                    }
+                )
+            summary_by_model_and_length.append(
+                {
+                    "model": model,
+                    "length": length,
+                    "avg_score": 90 + model_idx + length_idx / 10,
+                    "avg_prefill_attention_kernel_ms": 10 + model_idx + length_idx,
+                    "avg_decode_attention_kernel_ms_per_token": 1 + model_idx + length_idx / 10,
+                }
+            )
+    return {
+        "detail": detail,
+        "summary_by_model": [],
+        "summary_by_model_and_length": summary_by_model_and_length,
+        "summary_by_task": [],
+        "run_info": [],
+    }
+
+
 class CollectResultsTest(unittest.TestCase):
     """验证 RULER 汇总脚本的明细、聚合和 csv 输出。"""
 
@@ -338,6 +381,7 @@ class CollectResultsTest(unittest.TestCase):
             self.assertEqual(detail_row["attention_profile_sample_line_no"], 0)
             self.assertEqual(detail_row["attention_profile_sample_index"], 0)
             self.assertEqual(detail_row["attention_profile_records"], 2)
+            self.assertEqual(detail_row["attention_profile_timer_backends"], "cuda_event_attention_ops")
             self.assertAlmostEqual(detail_row["prefill_attention_kernel_ms_total"], 12.0)
             self.assertAlmostEqual(detail_row["attention_profile_generated_token_count_total"], 5.0)
             self.assertAlmostEqual(detail_row["prefill_forward_ms_total"], 30.0)
@@ -356,6 +400,54 @@ class CollectResultsTest(unittest.TestCase):
             self.assertEqual(summary_row["attention_profile_records"], 2)
             self.assertAlmostEqual(summary_row["avg_prefill_attention_kernel_ms"], 6.0)
             self.assertAlmostEqual(summary_row["avg_decode_attention_kernel_ms_per_token"], 1.8)
+
+    def test_flashattention_experiment_data_is_written_from_workbook(self):
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            experiment_dir = Path(tmp_dir) / "FlashAttention"
+            workbook = _make_flashattention_workbook(module)
+
+            written = module.write_flashattention_experiment_data(workbook, experiment_dir)
+
+            self.assertEqual(
+                sorted(path.name for path in written),
+                [
+                    "GLM_flashattention_ruler_scores.csv",
+                    "Llama_flashattention_ruler_scores.csv",
+                    "Qwen_flashattention_ruler_scores.csv",
+                ],
+            )
+            llama_rows = _read_csv(experiment_dir / "Llama_flashattention_ruler_scores.csv")
+            self.assertEqual([row["length"] for row in llama_rows], ["4k", "8k", "16k", "32k", "64k"])
+            self.assertEqual(list(llama_rows[0].keys()), module.FLASHATTENTION_EXPERIMENT_COLUMNS)
+            self.assertEqual(llama_rows[0]["niah_single_1"], "80.0")
+            self.assertEqual(llama_rows[0]["overall"], "90.0")
+            self.assertEqual(llama_rows[0]["avg_prefill_attention_kernel_ms"], "10")
+            self.assertEqual(llama_rows[0]["avg_decode_attention_kernel_ms_per_token"], "1.0")
+
+    def test_flashattention_experiment_data_rejects_incomplete_attention_profiles_without_overwrite(self):
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            experiment_dir = Path(tmp_dir) / "FlashAttention"
+            experiment_dir.mkdir()
+            existing = experiment_dir / "Llama_flashattention_ruler_scores.csv"
+            existing.write_text("old\n", encoding="utf-8")
+            workbook = _make_flashattention_workbook(module)
+            workbook["detail"][0]["attention_profile_records"] = 499
+
+            with self.assertRaisesRegex(ValueError, "attention_profile_records"):
+                module.write_flashattention_experiment_data(workbook, experiment_dir)
+
+            self.assertEqual(existing.read_text(encoding="utf-8"), "old\n")
+
+    def test_flashattention_experiment_data_requires_cuda_event_backend(self):
+        module = _load_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workbook = _make_flashattention_workbook(module)
+            workbook["detail"][0]["attention_profile_timer_backends"] = "perf_counter_attention_ops"
+
+            with self.assertRaisesRegex(ValueError, "cuda_event_attention_ops"):
+                module.write_flashattention_experiment_data(workbook, Path(tmp_dir) / "FlashAttention")
 
 
 if __name__ == "__main__":

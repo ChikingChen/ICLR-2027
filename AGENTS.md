@@ -102,6 +102,11 @@
 - `ruler_sample_counts_4k_64k.csv`
   - 当前工作区 4k、8k、16k、32k、64k 样本数统计输出。
   - 每行对应一个任务，每列对应一个长度，当前 13 个任务每个长度均为 500 条。
+- `experiment_data/FlashAttention/`
+  - FlashAttention RULER 最终实验数据目录。
+  - 当前包含 Llama、Qwen 和 GLM 三个模型的 `*_flashattention_ruler_scores.csv`。
+  - 这些 CSV 的列为 `length`、13 个 synthetic 任务分数、`overall`、`avg_prefill_attention_kernel_ms` 和 `avg_decode_attention_kernel_ms_per_token`。
+  - 使用 runner 的 `--flashattention-experiment-dir ../../experiment_data/FlashAttention` 可在 `--auto-evaluate` 汇总后自动更新；更新前会校验三模型、4k 到 64k、13 个任务、预测行数、全样本 attention profile 记录数和 `cuda_event_attention_ops` backend。
 
 ### RULER 关键目录和脚本
 
@@ -290,6 +295,7 @@ dry-run 只打印任务矩阵和将要执行的 `RULER/scripts/pred/call_api.py`
 - `--timing-file`：结构化任务耗时 jsonl；默认写到 `RULER/benchmark_root/local_eval/ruler_timing.jsonl`。
 - `--auto-evaluate`：全部子任务结束后调用 `RULER/scripts/eval/collect_results.py` 生成统一 csv 汇总。
 - `--report-file`：统一汇总 csv 主输出路径，必须使用 `.csv` 后缀；默认写到 `RULER/benchmark_root/local_eval/ruler_results.csv`。汇总脚本还会写出同名前缀的 summary 和 run_info csv 文件。
+- `--flashattention-experiment-dir`：可选。需要配合 `--auto-evaluate` 使用；汇总完成后把三模型 4k 到 64k 的 FlashAttention 分数和 attention CUDA event timing 同步到指定目录，例如 `../../experiment_data/FlashAttention`。同步前会要求全部任务完成、预测行数等于输入样本数、每条预测都有 `attention_profile` 记录，且 timing backend 必须为 `cuda_event_attention_ops`。
 - `--dry-run`：只打印命令，不启动推理。
 
 ### 4. 正式运行预测
@@ -336,6 +342,32 @@ conda run --no-capture-output -n model python -B run_parquet_parallel.py \
 如果要在预测时记录每个生成 token 的困惑度，应加上 `--log-generation-token-ppl`。该参数会同时保留主预测 jsonl 中的样本级 PPL 字段，并额外为每个任务写出 `<任务>.generation_tokens.jsonl`。
 
 如果要记录每条样本的 prefill/decode forward 耗时和每条样本的 attention CUDA event 时间，应同时加上 `--log-prefill-decode-timing --profile-attention-kernels`。两类 timing 都会覆盖实际预测样本，统一写入 `<任务>.generation_timing.jsonl`。
+
+如果要跑默认三模型 4k 到 64k FlashAttention 实验，并在跑完后自动更新 `experiment_data/FlashAttention/`，使用：
+
+```bash
+cd /data/czy/ICLR-2027/RULER/scripts
+conda run --no-capture-output -n model python -B run_parquet_parallel.py \
+  --model Llama-3.1-8B=../../models/Llama-3.1-8B \
+  --model Qwen2.5-7B-Instruct-1M=../../models/Qwen2.5-7B-Instruct-1M \
+  --model GLM-4-9B-Chat-1M=../../models/GLM-4-9B-Chat-1M \
+  --seq-lengths 4096,8192,16384,32768,65536 \
+  --tasks all \
+  --gpus 0,2,3 \
+  --max-workers 3 \
+  --server-type hf \
+  --batch-size 1 \
+  --poll-interval 10 \
+  --log-batch-progress \
+  --log-prefill-decode-timing \
+  --profile-attention-kernels \
+  --auto-evaluate \
+  --report-file ../benchmark_root/local_eval/ruler_results_4k_64k_three_models_flashattention.csv \
+  --flashattention-experiment-dir ../../experiment_data/FlashAttention \
+  --overwrite-existing
+```
+
+如果使用 `--skip-existing` 续跑，只有已有预测旁边已经存在完整 `<任务>.generation_timing.jsonl`，且其中每条预测都有 `timer_backend=cuda_event_attention_ops` 的 `attention_profile` 记录时，最终实验目录才会通过校验并更新。
 
 如果要跑遮住 `<|begin_of_text|>` 的 RULER 4k 全任务实验，可以给 Llama 单独起一个新的模型别名，并加上 `--mask-bos-token`：
 
@@ -436,6 +468,14 @@ conda run --no-capture-output -n model python eval/collect_results.py \
   --tasks all \
   --timing-file ../benchmark_root/local_eval/ruler_timing.jsonl \
   --output-file ../benchmark_root/local_eval/ruler_results_4k_all_models.csv
+```
+
+如果要把已经完成且包含全样本 attention CUDA event timing 的三模型 4k 到 64k 汇总同步到最终 FlashAttention 实验数据目录，可在 `collect_results.py` 命令中额外传：
+
+```bash
+  --seq-lengths 4096,8192,16384,32768,65536 \
+  --models Llama-3.1-8B,Qwen2.5-7B-Instruct-1M,GLM-4-9B-Chat-1M \
+  --flashattention-experiment-dir ../../experiment_data/FlashAttention
 ```
 
 `ruler_results_4k_all_models.csv` 是 `detail` 明细主表，汇总脚本还会生成同名前缀的四个 csv：

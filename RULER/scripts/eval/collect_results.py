@@ -133,6 +133,30 @@ SUMMARY_BY_TASK_COLUMNS = [
 
 RUN_INFO_COLUMNS = ["key", "value"]
 
+FLASHATTENTION_EXPERIMENT_COLUMNS = [
+    "length",
+    *SYNTHETIC_TASKS,
+    "overall",
+    "avg_prefill_attention_kernel_ms",
+    "avg_decode_attention_kernel_ms_per_token",
+]
+
+FLASHATTENTION_MODEL_FILES = {
+    "Llama-3.1-8B": "Llama_flashattention_ruler_scores.csv",
+    "Qwen2.5-7B-Instruct-1M": "Qwen_flashattention_ruler_scores.csv",
+    "GLM-4-9B-Chat-1M": "GLM_flashattention_ruler_scores.csv",
+}
+
+FLASHATTENTION_LENGTH_LABELS = {
+    4096: "4k",
+    8192: "8k",
+    16384: "16k",
+    32768: "32k",
+    65536: "64k",
+}
+
+FLASHATTENTION_REQUIRED_LENGTHS = list(FLASHATTENTION_LENGTH_LABELS)
+
 
 class TimingRecord:
     """保存 runner timing jsonl 中一个任务的耗时字段。"""
@@ -174,6 +198,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tasks", default="all", help="逗号分隔任务过滤或 all。")
     parser.add_argument("--timing-file", type=Path, default=None, help="runner 结构化 timing jsonl。")
     parser.add_argument("--output-file", type=Path, default=None, help="csv 主输出路径。")
+    parser.add_argument(
+        "--flashattention-experiment-dir",
+        type=Path,
+        default=None,
+        help="可选：把三模型 4k-64k FlashAttention 结果同步到指定实验数据目录。",
+    )
     return parser
 
 
@@ -321,6 +351,13 @@ def aggregate_generation_timing(rows: Sequence[Mapping[str, Any]]) -> Dict[str, 
 
     sample_rows = [row for row in rows if row.get("record_type") == "sample_timing"]
     profile_rows = [row for row in rows if row.get("record_type") == "attention_profile"]
+    profile_timer_backends = sorted(
+        {
+            str(row.get("timer_backend"))
+            for row in profile_rows
+            if row.get("timer_backend") is not None and row.get("timer_backend") != ""
+        }
+    )
     prefill_total = sum_optional(row.get("prefill_forward_ms") for row in sample_rows)
     decode_total = sum_optional(row.get("decode_forward_ms_total") for row in sample_rows)
     generated_token_total = sum_optional(row.get("generated_token_count") for row in sample_rows)
@@ -354,6 +391,7 @@ def aggregate_generation_timing(rows: Sequence[Mapping[str, Any]]) -> Dict[str, 
         "attention_profile_sample_line_no": profile.get("sample_line_no"),
         "attention_profile_sample_index": profile.get("sample_index"),
         "attention_profile_records": len(profile_rows),
+        "attention_profile_timer_backends": ",".join(profile_timer_backends),
         "prefill_attention_kernel_records": len(profile_prefill_values),
         "prefill_attention_kernel_ms_total": profile_prefill_total,
         "prefill_attention_kernel_ms": average(profile_prefill_values),
@@ -664,6 +702,137 @@ def validate_csv_output_file(output_file: Path) -> None:
         raise ValueError(f"--output-file 必须使用 .csv 后缀：{output_file}")
 
 
+def _int_field(row: Mapping[str, Any], field: str) -> int:
+    """读取应为整数的汇总字段。"""
+
+    value = row.get(field)
+    if value is None or value == "":
+        return 0
+    return int(value)
+
+
+def _backend_set(row: Mapping[str, Any]) -> set:
+    """解析 detail 行中记录的 attention timing backend 集合。"""
+
+    raw = row.get("attention_profile_timer_backends")
+    if raw is None or raw == "":
+        return set()
+    if isinstance(raw, str):
+        return {part.strip() for part in raw.split(",") if part.strip()}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(part).strip() for part in raw if str(part).strip()}
+    return {str(raw)}
+
+
+def _require_value(row: Mapping[str, Any], field: str, context: str) -> Any:
+    """返回非空字段；缺失时抛出带上下文的错误。"""
+
+    value = row.get(field)
+    if value is None or value == "":
+        raise ValueError(f"FlashAttention 数据不完整：{context} 缺少 {field}")
+    return value
+
+
+def build_flashattention_experiment_tables(
+    workbook: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """从 RULER workbook 构造三模型 FlashAttention 最终实验 CSV 行。"""
+
+    detail_rows = workbook.get("detail", [])
+    summary_rows = workbook.get("summary_by_model_and_length", [])
+    detail_index = {
+        (str(row.get("model")), int(row.get("length")), str(row.get("task"))): row
+        for row in detail_rows
+        if row.get("model") is not None and row.get("length") is not None and row.get("task") is not None
+    }
+    summary_index = {
+        (str(row.get("model")), int(row.get("length"))): row
+        for row in summary_rows
+        if row.get("model") is not None and row.get("length") is not None
+    }
+
+    tables: Dict[str, List[Dict[str, Any]]] = {}
+    for model, filename in FLASHATTENTION_MODEL_FILES.items():
+        model_rows: List[Dict[str, Any]] = []
+        for length in FLASHATTENTION_REQUIRED_LENGTHS:
+            label = FLASHATTENTION_LENGTH_LABELS[length]
+            summary_context = f"model={model} length={label}"
+            summary_row = summary_index.get((model, length))
+            if summary_row is None:
+                raise ValueError(f"FlashAttention 数据不完整：缺少 {summary_context} 的 summary 行")
+
+            output_row: Dict[str, Any] = {"length": label}
+            for task in SYNTHETIC_TASKS:
+                context = f"model={model} length={label} task={task}"
+                detail_row = detail_index.get((model, length, task))
+                if detail_row is None:
+                    raise ValueError(f"FlashAttention 数据不完整：缺少 {context} 的 detail 行")
+                if detail_row.get("status") != "completed":
+                    raise ValueError(f"FlashAttention 数据不完整：{context} status={detail_row.get('status')}")
+
+                samples = _int_field(detail_row, "samples")
+                pred_lines = _int_field(detail_row, "pred_lines")
+                if samples <= 0 or pred_lines != samples:
+                    raise ValueError(
+                        f"FlashAttention 数据不完整：{context} pred_lines={pred_lines} samples={samples}"
+                    )
+
+                attention_records = _int_field(detail_row, "attention_profile_records")
+                if attention_records != pred_lines:
+                    raise ValueError(
+                        "FlashAttention 数据不完整："
+                        f"{context} attention_profile_records={attention_records} pred_lines={pred_lines}"
+                    )
+
+                backends = _backend_set(detail_row)
+                if backends != {"cuda_event_attention_ops"}:
+                    raise ValueError(
+                        "FlashAttention 数据不完整："
+                        f"{context} attention backend 必须是 cuda_event_attention_ops，实际为 {sorted(backends)}"
+                    )
+                output_row[task] = _require_value(detail_row, "score", context)
+
+            output_row["overall"] = _require_value(summary_row, "avg_score", summary_context)
+            output_row["avg_prefill_attention_kernel_ms"] = _require_value(
+                summary_row,
+                "avg_prefill_attention_kernel_ms",
+                summary_context,
+            )
+            output_row["avg_decode_attention_kernel_ms_per_token"] = _require_value(
+                summary_row,
+                "avg_decode_attention_kernel_ms_per_token",
+                summary_context,
+            )
+            model_rows.append(output_row)
+        tables[filename] = model_rows
+    return tables
+
+
+def write_flashattention_experiment_data(
+    workbook: Mapping[str, Sequence[Mapping[str, Any]]],
+    experiment_dir: Path,
+) -> List[Path]:
+    """把三模型 4k-64k FlashAttention 汇总写入最终实验数据目录。"""
+
+    tables = build_flashattention_experiment_tables(workbook)
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_files: List[Tuple[Path, Path]] = []
+    for filename, rows in tables.items():
+        target = experiment_dir / filename
+        temp_file = target.with_name(f".{target.name}.tmp")
+        with temp_file.open("w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerows(rows_to_matrix(rows, FLASHATTENTION_EXPERIMENT_COLUMNS))
+        temp_files.append((temp_file, target))
+
+    written = []
+    for temp_file, target in temp_files:
+        temp_file.replace(target)
+        written.append(target)
+    return written
+
+
 def write_csv(output_file: Path, workbook: Mapping[str, Sequence[Mapping[str, Any]]]) -> List[Path]:
     """用标准库把五张汇总表写成一组 csv 文件，返回实际写出的路径。"""
 
@@ -705,6 +874,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         timing_file=args.timing_file,
     )
     written_files = write_csv(output_file, workbook)
+    if args.flashattention_experiment_dir is not None:
+        written_files.extend(
+            write_flashattention_experiment_data(
+                workbook=workbook,
+                experiment_dir=args.flashattention_experiment_dir,
+            )
+        )
     print(f"Saved RULER results to {', '.join(str(path) for path in written_files)}")
     return 0
 
