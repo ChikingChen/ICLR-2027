@@ -204,6 +204,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="可选：把三模型 4k-64k FlashAttention 结果同步到指定实验数据目录。",
     )
+    parser.add_argument(
+        "--flashattention-score-only",
+        action="store_true",
+        help="写 FlashAttention 实验 CSV 时只同步分数，attention timing 字段留空。",
+    )
+    parser.add_argument(
+        "--attention-profile-output-root",
+        type=Path,
+        default=None,
+        help="可选：从单独的 attention profile 输出目录读取单样本 CUDA event timing。",
+    )
     return parser
 
 
@@ -711,6 +722,15 @@ def _int_field(row: Mapping[str, Any], field: str) -> int:
     return int(value)
 
 
+def _required_int_field(row: Mapping[str, Any], field: str, context: str) -> int:
+    """读取必须存在的整数字段；缺失时报出上下文。"""
+
+    value = row.get(field)
+    if value is None or value == "":
+        raise ValueError(f"FlashAttention 数据不完整：{context} 缺少 {field}")
+    return int(value)
+
+
 def _backend_set(row: Mapping[str, Any]) -> set:
     """解析 detail 行中记录的 attention timing backend 集合。"""
 
@@ -733,23 +753,53 @@ def _require_value(row: Mapping[str, Any], field: str, context: str) -> Any:
     return value
 
 
+def _index_rows_by_model_length_task(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[Tuple[str, int, str], Mapping[str, Any]]:
+    """按 model、length、task 为 detail 行建索引。"""
+
+    return {
+        (str(row.get("model")), int(row.get("length")), str(row.get("task"))): row
+        for row in rows
+        if row.get("model") is not None and row.get("length") is not None and row.get("task") is not None
+    }
+
+
+def _index_rows_by_model_length(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[Tuple[str, int], Mapping[str, Any]]:
+    """按 model、length 为 summary 行建索引。"""
+
+    return {
+        (str(row.get("model")), int(row.get("length"))): row
+        for row in rows
+        if row.get("model") is not None and row.get("length") is not None
+    }
+
+
 def build_flashattention_experiment_tables(
     workbook: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    score_only: bool = False,
+    attention_profile_workbook: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """从 RULER workbook 构造三模型 FlashAttention 最终实验 CSV 行。"""
 
-    detail_rows = workbook.get("detail", [])
-    summary_rows = workbook.get("summary_by_model_and_length", [])
-    detail_index = {
-        (str(row.get("model")), int(row.get("length")), str(row.get("task"))): row
-        for row in detail_rows
-        if row.get("model") is not None and row.get("length") is not None and row.get("task") is not None
-    }
-    summary_index = {
-        (str(row.get("model")), int(row.get("length"))): row
-        for row in summary_rows
-        if row.get("model") is not None and row.get("length") is not None
-    }
+    if score_only and attention_profile_workbook is not None:
+        raise ValueError("--flashattention-score-only 不能和 --attention-profile-output-root 同时使用")
+
+    detail_index = _index_rows_by_model_length_task(workbook.get("detail", []))
+    summary_index = _index_rows_by_model_length(workbook.get("summary_by_model_and_length", []))
+    if attention_profile_workbook is None:
+        timing_detail_index = detail_index
+        timing_summary_index = summary_index
+        timing_source = "score_workbook"
+    else:
+        timing_detail_index = _index_rows_by_model_length_task(attention_profile_workbook.get("detail", []))
+        timing_summary_index = _index_rows_by_model_length(
+            attention_profile_workbook.get("summary_by_model_and_length", [])
+        )
+        timing_source = "single_sample_profile_workbook"
 
     tables: Dict[str, List[Dict[str, Any]]] = {}
     for model, filename in FLASHATTENTION_MODEL_FILES.items():
@@ -760,6 +810,9 @@ def build_flashattention_experiment_tables(
             summary_row = summary_index.get((model, length))
             if summary_row is None:
                 raise ValueError(f"FlashAttention 数据不完整：缺少 {summary_context} 的 summary 行")
+            timing_summary_row = timing_summary_index.get((model, length))
+            if not score_only and timing_summary_row is None:
+                raise ValueError(f"FlashAttention 数据不完整：缺少 {summary_context} 的 attention timing summary 行")
 
             output_row: Dict[str, Any] = {"length": label}
             for task in SYNTHETIC_TASKS:
@@ -777,32 +830,58 @@ def build_flashattention_experiment_tables(
                         f"FlashAttention 数据不完整：{context} pred_lines={pred_lines} samples={samples}"
                     )
 
-                attention_records = _int_field(detail_row, "attention_profile_records")
-                if attention_records != pred_lines:
-                    raise ValueError(
-                        "FlashAttention 数据不完整："
-                        f"{context} attention_profile_records={attention_records} pred_lines={pred_lines}"
-                    )
+                if not score_only:
+                    timing_detail_row = timing_detail_index.get((model, length, task))
+                    if timing_detail_row is None:
+                        raise ValueError(f"FlashAttention 数据不完整：缺少 {context} 的 attention timing detail 行")
+                    attention_records = _int_field(timing_detail_row, "attention_profile_records")
+                    if timing_source == "score_workbook":
+                        if attention_records != pred_lines:
+                            raise ValueError(
+                                "FlashAttention 数据不完整："
+                                f"{context} attention_profile_records={attention_records} pred_lines={pred_lines}"
+                            )
+                    else:
+                        if attention_records != 1:
+                            raise ValueError(
+                                "FlashAttention 数据不完整："
+                                f"{context} attention_profile_records={attention_records}，单样本计时要求为 1"
+                            )
+                        sample_line_no = _required_int_field(
+                            timing_detail_row,
+                            "attention_profile_sample_line_no",
+                            context,
+                        )
+                        if sample_line_no != 0:
+                            raise ValueError(
+                                "FlashAttention 数据不完整："
+                                f"{context} attention_profile_sample_line_no={sample_line_no}，必须为 0"
+                            )
 
-                backends = _backend_set(detail_row)
-                if backends != {"cuda_event_attention_ops"}:
-                    raise ValueError(
-                        "FlashAttention 数据不完整："
-                        f"{context} attention backend 必须是 cuda_event_attention_ops，实际为 {sorted(backends)}"
-                    )
+                    backends = _backend_set(timing_detail_row)
+                    if backends != {"cuda_event_attention_ops"}:
+                        raise ValueError(
+                            "FlashAttention 数据不完整："
+                            f"{context} attention backend 必须是 cuda_event_attention_ops，实际为 {sorted(backends)}"
+                        )
                 output_row[task] = _require_value(detail_row, "score", context)
 
             output_row["overall"] = _require_value(summary_row, "avg_score", summary_context)
-            output_row["avg_prefill_attention_kernel_ms"] = _require_value(
-                summary_row,
-                "avg_prefill_attention_kernel_ms",
-                summary_context,
-            )
-            output_row["avg_decode_attention_kernel_ms_per_token"] = _require_value(
-                summary_row,
-                "avg_decode_attention_kernel_ms_per_token",
-                summary_context,
-            )
+            if score_only:
+                output_row["avg_prefill_attention_kernel_ms"] = None
+                output_row["avg_decode_attention_kernel_ms_per_token"] = None
+            else:
+                assert timing_summary_row is not None
+                output_row["avg_prefill_attention_kernel_ms"] = _require_value(
+                    timing_summary_row,
+                    "avg_prefill_attention_kernel_ms",
+                    summary_context,
+                )
+                output_row["avg_decode_attention_kernel_ms_per_token"] = _require_value(
+                    timing_summary_row,
+                    "avg_decode_attention_kernel_ms_per_token",
+                    summary_context,
+                )
             model_rows.append(output_row)
         tables[filename] = model_rows
     return tables
@@ -811,10 +890,17 @@ def build_flashattention_experiment_tables(
 def write_flashattention_experiment_data(
     workbook: Mapping[str, Sequence[Mapping[str, Any]]],
     experiment_dir: Path,
+    *,
+    score_only: bool = False,
+    attention_profile_workbook: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
 ) -> List[Path]:
     """把三模型 4k-64k FlashAttention 汇总写入最终实验数据目录。"""
 
-    tables = build_flashattention_experiment_tables(workbook)
+    tables = build_flashattention_experiment_tables(
+        workbook,
+        score_only=score_only,
+        attention_profile_workbook=attention_profile_workbook,
+    )
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     temp_files: List[Tuple[Path, Path]] = []
@@ -859,6 +945,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """命令行入口。"""
 
     args = build_parser().parse_args(argv)
+    if args.flashattention_score_only and args.attention_profile_output_root is not None:
+        raise ValueError("--flashattention-score-only 不能和 --attention-profile-output-root 同时使用")
     output_file = args.output_file or (args.output_root / "ruler_results.csv")
     validate_csv_output_file(output_file)
     models = parse_csv(args.models) or discover_models(args.output_root, args.benchmark)
@@ -873,12 +961,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tasks=tasks,
         timing_file=args.timing_file,
     )
+    attention_profile_workbook = None
+    if args.attention_profile_output_root is not None:
+        attention_profile_workbook = collect_results(
+            output_root=args.attention_profile_output_root,
+            data_root=args.data_root,
+            benchmark=args.benchmark,
+            models=models,
+            lengths=lengths,
+            tasks=tasks,
+            timing_file=None,
+        )
     written_files = write_csv(output_file, workbook)
     if args.flashattention_experiment_dir is not None:
         written_files.extend(
             write_flashattention_experiment_data(
                 workbook=workbook,
                 experiment_dir=args.flashattention_experiment_dir,
+                score_only=args.flashattention_score_only,
+                attention_profile_workbook=attention_profile_workbook,
             )
         )
     print(f"Saved RULER results to {', '.join(str(path) for path in written_files)}")

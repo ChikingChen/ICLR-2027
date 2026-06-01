@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -45,6 +46,7 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertIn("--log_prefill_decode_timing", source)
         self.assertIn("--profile_attention_kernels", source)
         self.assertIn("--attention_profile_sample_offset", source)
+        self.assertIn("--max_samples", source)
         self.assertIn("--mask_bos_token", source)
         self.assertIn("--log_attn_implementation", source)
         self.assertIn("[BATCH_START]", source)
@@ -132,6 +134,61 @@ class CallApiProgressTest(unittest.TestCase):
         validated = module.validate_runtime_args(parsed)
 
         self.assertEqual(validated.attention_profile_sample_offset, 3)
+
+    def test_validate_runtime_args_rejects_non_positive_max_samples(self):
+        module = _load_call_api_module()
+
+        parsed = module.parser.parse_args(
+            [
+                "--data_dir",
+                "/tmp/ruler-data",
+                "--save_dir",
+                "/tmp/ruler-pred",
+                "--task",
+                "niah_single_1",
+                "--max_samples",
+                "0",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "max_samples.*正整数"):
+            module.validate_runtime_args(parsed)
+
+    def test_select_input_samples_limits_before_skipping_existing_predictions(self):
+        module = _load_call_api_module()
+
+        all_data = [
+            {"index": 0, "sample_line_no": 0},
+            {"index": 1, "sample_line_no": 1},
+        ]
+
+        limited = module.select_input_samples(
+            all_data=all_data,
+            pred_file=Path("/tmp/does-not-exist.jsonl"),
+            max_samples=1,
+        )
+
+        self.assertEqual([row["index"] for row in limited], [0])
+
+    def test_select_input_samples_does_not_backfill_when_first_limited_sample_exists(self):
+        module = _load_call_api_module()
+
+        all_data = [
+            {"index": 0, "sample_line_no": 0},
+            {"index": 1, "sample_line_no": 1},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pred_file = Path(tmp_dir) / "niah_single_1.jsonl"
+            pred_file.write_text(json.dumps({"index": 0}) + "\n", encoding="utf-8")
+
+            limited = module.select_input_samples(
+                all_data=all_data,
+                pred_file=pred_file,
+                max_samples=1,
+            )
+
+        self.assertEqual(limited, [])
 
     def test_process_batch_with_retries_returns_after_transient_failure(self):
         module = _load_call_api_module()
@@ -335,6 +392,27 @@ class CallApiProgressTest(unittest.TestCase):
         self.assertEqual(record["input_file"], "/tmp/validation.jsonl")
         self.assertEqual(record["prefill_attention_kernel_ms"], 3.0)
         json.dumps(record, ensure_ascii=False)
+
+    def test_attention_profile_record_documents_first_sample_policy(self):
+        module = _load_call_api_module()
+
+        record = module.build_attention_profile_record(
+            profile={
+                "timer_backend": "cuda_event_attention_ops",
+                "input_tokens": 128,
+                "generated_token_count": 2,
+                "prefill_attention_kernel_ms": 3.0,
+            },
+            task="vt",
+            sample={"index": 7},
+            sample_line_no=0,
+            input_file=Path("/tmp/validation.jsonl"),
+            profile_sample_limit=1,
+        )
+
+        self.assertEqual(record["profile_sample_policy"], "first_input_records")
+        self.assertEqual(record["profile_sample_limit"], 1)
+        self.assertEqual(record["sample_line_no"], 0)
 
 
 if __name__ == "__main__":

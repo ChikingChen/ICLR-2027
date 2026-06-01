@@ -84,6 +84,7 @@ class RunnerConfig(NamedTuple):
     log_prefill_decode_timing: bool
     profile_attention_kernels: bool
     attention_profile_sample_offset: int
+    max_samples_per_task: Optional[int]
     mask_bos_token: bool
     log_attn_implementation: bool
     overwrite_existing: bool
@@ -91,6 +92,7 @@ class RunnerConfig(NamedTuple):
     auto_evaluate: bool
     report_file: Path
     flashattention_experiment_dir: Optional[Path]
+    flashattention_score_only: bool
 
 
 class RunningJob(NamedTuple):
@@ -332,6 +334,8 @@ def build_call_api_command(job: Job, config: RunnerConfig) -> List[str]:
     if config.profile_attention_kernels:
         command.append("--profile_attention_kernels")
         command.extend(["--attention_profile_sample_offset", str(config.attention_profile_sample_offset)])
+    if config.max_samples_per_task is not None:
+        command.extend(["--max_samples", str(config.max_samples_per_task)])
     if config.mask_bos_token:
         command.append("--mask_bos_token")
     if config.log_attn_implementation:
@@ -458,6 +462,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="兼容旧参数；当前 profile 覆盖所有实际预测样本。",
     )
     parser.add_argument(
+        "--max-samples-per-task",
+        type=int,
+        default=None,
+        help="每个任务最多处理多少条输入样本；不传表示处理全部样本。",
+    )
+    parser.add_argument(
         "--mask-bos-token",
         action="store_true",
         help="保留 BOS token，但把 position 0 的 attention_mask 置为 0，用于遮住 <|begin_of_text|> 的实验。",
@@ -489,6 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="可选：自动汇总后把三模型 4k-64k FlashAttention 结果同步到指定实验数据目录。",
     )
     parser.add_argument(
+        "--flashattention-score-only",
+        action="store_true",
+        help="同步 FlashAttention 实验 CSV 时只写分数，attention timing 字段留空。",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="只打印将要执行的任务和命令，不启动推理。",
@@ -510,6 +525,8 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         raise ValueError("--poll-interval 必须是正数")
     if args.attention_top_k <= 0:
         raise ValueError("--attention-top-k 必须是正整数")
+    if args.max_samples_per_task is not None and args.max_samples_per_task <= 0:
+        raise ValueError("--max-samples-per-task 必须是正整数")
     if args.profile_attention_kernels and args.log_attention_scores:
         raise ValueError("--profile-attention-kernels 不能和 --log-attention-scores 同时使用")
     timing_file = args.timing_file if args.timing_file is not None else args.output_root / DEFAULT_TIMING_NAME
@@ -541,6 +558,7 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         log_prefill_decode_timing=args.log_prefill_decode_timing,
         profile_attention_kernels=args.profile_attention_kernels,
         attention_profile_sample_offset=args.attention_profile_sample_offset,
+        max_samples_per_task=args.max_samples_per_task,
         mask_bos_token=args.mask_bos_token,
         log_attn_implementation=args.log_attn_implementation,
         overwrite_existing=args.overwrite_existing,
@@ -548,6 +566,7 @@ def build_config(args: argparse.Namespace, scripts_dir: Optional[Path] = None) -
         auto_evaluate=args.auto_evaluate,
         report_file=report_file,
         flashattention_experiment_dir=args.flashattention_experiment_dir,
+        flashattention_score_only=args.flashattention_score_only,
     )
 
 
@@ -692,6 +711,8 @@ def build_collect_results_command(
                 str(config.flashattention_experiment_dir),
             ]
         )
+    if config.flashattention_score_only:
+        command.append("--flashattention-score-only")
     return command
 
 
@@ -748,6 +769,8 @@ def launch_job(job: Job, gpu: int, config: RunnerConfig) -> RunningJob:
     )
     output_thread.start()
     total_samples = count_jsonl_lines(task_file_for(job, config))
+    if config.max_samples_per_task is not None:
+        total_samples = min(total_samples, config.max_samples_per_task)
     print(f"[START] gpu={gpu} pid={process.pid} {format_job(job)} log={log_file}", flush=True)
     return RunningJob(
         job=job,

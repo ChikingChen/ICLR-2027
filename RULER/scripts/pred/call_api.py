@@ -70,6 +70,7 @@ parser.add_argument("--task", type=str, required=True, help='Options: tasks in b
 parser.add_argument("--subset", type=str, default='validation', help='Options: validation or test')
 parser.add_argument("--chunk_idx", type=int, default=0, help='index of current split chunk')
 parser.add_argument("--chunk_amount", type=int, default=1, help='size of split chunk')
+parser.add_argument("--max_samples", type=int, default=None, help="只处理输入 jsonl 的前 N 条样本。")
 
 # Server
 parser.add_argument("--server_type", default='nemo', action=ServerAction, choices=SERVER_TYPES)
@@ -109,6 +110,8 @@ def validate_runtime_args(parsed_args):
         raise ValueError("--batch_size 当前固定为 1，请不要传入其他值。")
     if parsed_args.max_retries <= 0:
         raise ValueError("--max_retries 必须是正整数")
+    if parsed_args.max_samples is not None and parsed_args.max_samples <= 0:
+        raise ValueError("--max_samples 必须是正整数")
     if parsed_args.attention_top_k <= 0:
         raise ValueError("--attention_top_k 必须是正整数")
     if parsed_args.log_attention_scores and parsed_args.server_type != "hf":
@@ -405,19 +408,46 @@ def build_generation_timing_record(pred, index, task, sample_line_no):
     return record
 
 
-def build_attention_profile_record(profile, task, sample, sample_line_no, input_file):
+def profile_sample_policy(profile_sample_limit):
+    """返回当前 attention profile 样本选择策略说明。"""
+
+    if profile_sample_limit is None:
+        return "all_input_records"
+    return "first_input_records"
+
+
+def build_attention_profile_record(
+    profile,
+    task,
+    sample,
+    sample_line_no,
+    input_file,
+    profile_sample_limit=None,
+):
     """把单条样本的 attention timing 结果转换成 sidecar jsonl 记录。"""
 
     record = {
         "record_type": "attention_profile",
         "task": task,
-        "profile_sample_policy": "all_input_records",
+        "profile_sample_policy": profile_sample_policy(profile_sample_limit),
         "sample_line_no": sample_line_no,
         "sample_index": sample.get("index"),
         "input_file": str(input_file),
     }
+    if profile_sample_limit is not None:
+        record["profile_sample_limit"] = profile_sample_limit
     record.update(profile)
     return record
+
+
+def select_input_samples(all_data, pred_file, max_samples=None):
+    """选择本次需要处理的样本；先限制原始前 N 条，再跳过已有预测。"""
+
+    data = list(all_data[:max_samples]) if max_samples is not None else list(all_data)
+    if os.path.exists(pred_file):
+        pred_index = {sample['index'] for sample in read_manifest(pred_file)}
+        data = [sample for sample in data if sample['index'] not in pred_index]
+    return data
 
 
 def main():
@@ -457,11 +487,11 @@ def main():
         sample = dict(sample)
         sample["sample_line_no"] = sample_line_no
         all_data.append(sample)
-    if os.path.exists(pred_file):
-        pred_index = [sample['index'] for sample in read_manifest(pred_file)]
-        data = [sample for sample in all_data if sample['index'] not in pred_index]
-    else:
-        data = list(all_data)
+    data = select_input_samples(
+        all_data=all_data,
+        pred_file=pred_file,
+        max_samples=args.max_samples,
+    )
 
     # Load api
     llm = get_llm(config['tokens_to_generate'])
@@ -531,6 +561,7 @@ def main():
                     sample={"index": index},
                     sample_line_no=sample_line_no,
                     input_file=task_file,
+                    profile_sample_limit=args.max_samples,
                 )
 
         if args.log_batch_progress:

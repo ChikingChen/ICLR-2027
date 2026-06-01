@@ -108,6 +108,8 @@ class RunParquetParallelTest(unittest.TestCase):
                 "--log-generation-token-ppl",
                 "--log-prefill-decode-timing",
                 "--profile-attention-kernels",
+                "--max-samples-per-task",
+                "1",
                 "--mask-bos-token",
                 "--log-attn-implementation",
             ]
@@ -125,6 +127,8 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertIn("--log_prefill_decode_timing", command)
         self.assertIn("--profile_attention_kernels", command)
         self.assertIn("--attention_profile_sample_offset", command)
+        self.assertIn("--max_samples", command)
+        self.assertEqual(command[command.index("--max_samples") + 1], "1")
         self.assertIn("--mask_bos_token", command)
         self.assertIn("--log_attn_implementation", command)
         self.assertIn("--batch_size", command)
@@ -133,6 +137,7 @@ class RunParquetParallelTest(unittest.TestCase):
         self.assertTrue(config.log_generation_token_ppl)
         self.assertTrue(config.log_prefill_decode_timing)
         self.assertTrue(config.profile_attention_kernels)
+        self.assertEqual(config.max_samples_per_task, 1)
         self.assertTrue(config.mask_bos_token)
         self.assertTrue(config.log_attn_implementation)
         self.assertEqual(module.prediction_file_for(job, config), Path("/data/local_eval/llama/synthetic/4096/pred/niah_single_1.jsonl"))
@@ -190,6 +195,26 @@ class RunParquetParallelTest(unittest.TestCase):
         config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
 
         self.assertEqual(config.attention_profile_sample_offset, 3)
+
+    def test_build_config_rejects_non_positive_max_samples_per_task(self):
+        module = _load_module()
+        args = module.build_parser().parse_args(
+            [
+                "--model",
+                "llama=/models/llama",
+                "--seq-lengths",
+                "4096",
+                "--tasks",
+                "niah_single_1",
+                "--gpus",
+                "0",
+                "--max-samples-per-task",
+                "0",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "max-samples-per-task.*正整数"):
+            module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
 
     def test_model_python_overrides_command_python_for_matching_model(self):
         module = _load_module()
@@ -432,6 +457,40 @@ class RunParquetParallelTest(unittest.TestCase):
             self.assertEqual(config.flashattention_experiment_dir, Path("/repo/experiment_data/FlashAttention"))
             self.assertIn("--flashattention-experiment-dir", command)
             self.assertIn("/repo/experiment_data/FlashAttention", command)
+
+    def test_collect_results_command_includes_flashattention_score_only(self):
+        module = _load_module()
+        args = module.build_parser().parse_args(
+            [
+                "--model",
+                "llama=/models/llama",
+                "--seq-lengths",
+                "4096",
+                "--tasks",
+                "niah_single_1",
+                "--gpus",
+                "0",
+                "--auto-evaluate",
+                "--flashattention-experiment-dir",
+                "/repo/experiment_data/FlashAttention",
+                "--flashattention-score-only",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            args.data_root = root / "parquet"
+            args.output_root = root / "local_eval"
+            config = module.build_config(args, scripts_dir=Path("/repo/RULER/scripts"))
+
+            command = module.build_collect_results_command(
+                config=config,
+                models=["llama"],
+                seq_lengths=[4096],
+                tasks=["niah_single_1"],
+            )
+
+            self.assertTrue(config.flashattention_score_only)
+            self.assertIn("--flashattention-score-only", command)
 
     def test_report_file_rejects_xlsx_suffix(self):
         module = _load_module()

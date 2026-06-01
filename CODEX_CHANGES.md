@@ -1,5 +1,34 @@
 # CODEX 变更说明
 
+## 2026-06-01 拆分 RULER 跑分和单样本 attention CUDA event timing
+
+### 变更文件
+
+- `AGENTS.md`
+- `RULER/scripts/pred/call_api.py`
+- `RULER/scripts/run_parquet_parallel.py`
+- `RULER/scripts/eval/collect_results.py`
+- `tests/test_call_api_progress.py`
+- `tests/test_run_parquet_parallel.py`
+- `tests/test_collect_results.py`
+- `CODEX_CHANGES.md`
+
+### 变更目的
+
+按用户要求，默认三模型 4k 到 64k FlashAttention RULER 正式跑分不再必须和 attention CUDA event timing 绑在一起。runner 新增 `--flashattention-score-only`，可在 `--auto-evaluate --flashattention-experiment-dir` 阶段只把 500 条全量 RULER 分数和 `overall` 写入 `experiment_data/FlashAttention/`，attention timing 两列留空。
+
+attention CUDA event timing 改为独立阶段：`call_api.py` 新增 `--max_samples`，runner 新增 `--max-samples-per-task` 并透传给子进程。使用 `--profile-attention-kernels --max-samples-per-task 1 --output-root ../benchmark_root/local_eval_attention_profile` 时，每个模型、长度和任务只处理原始输入 jsonl 的第 1 条样本，并在 `attention_profile` 记录中写入 `profile_sample_policy=first_input_records` 和 `profile_sample_limit=1`。
+
+`collect_results.py` 新增 `--attention-profile-output-root`，可把正式跑分目录的分数与独立 timing 目录的单样本 attention profile 合并，再覆盖更新最终 FlashAttention CSV。合并时会校验正式分数为全量完成、独立 timing 每任务正好 1 条 `attention_profile`、`sample_line_no=0`，且 backend 为 `cuda_event_attention_ops`。
+
+### 验证方式
+
+已按 TDD 先写红测确认新参数、单样本选择、score-only 导出和 profile workbook 合并缺失，再实现功能。最终验证：
+
+```bash
+conda run --no-capture-output -n model python -m unittest tests.test_call_api_progress tests.test_run_parquet_parallel tests.test_collect_results
+```
+
 ## 2026-06-01 新增 FlashAttention 实验数据自动同步
 
 ### 变更文件
